@@ -88,18 +88,7 @@ Sinta-se à vontade para abrir Issues ou Pull Requests para melhorar este worker
 Autor: lpacheco88
 
 
----
 
-### Passo 2: Subir o README para o GitHub
-
-Agora, adicione o novo arquivo ao Git e faça o push com os seguintes comandos:
-
-```bash
-# 1. Adiciona o README ao staging area
-git add README.md
-
-# 2. Faz o commit
-git commit -m "docs: adiciona README.md com instruções de instalação e uso"
 
 # 3. Envia para o GitHub
 git push origin main
