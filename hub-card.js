@@ -1,0 +1,365 @@
+#!/usr/bin/env node
+// hub-card.js — ciclo de vida de UM card do backend no Azure DevOps (Task Code "Back — ...").
+//
+//   node hub-card.js features [--epic <id>]                 lista as features/PBIs do épico (para escolher o pai)
+//   node hub-card.js get <id>                               mostra o card e o pai
+//   node hub-card.js create --card <md> (--parent <id> | --like <taskId>) [--title "..."] [--assign <email>]
+//   node hub-card.js link <id> --card <md>                  liga um card que já existe no Azure ao nosso card
+//   node hub-card.js start  (<id> | --card <md>) [--branch <b>]            -> Codificação
+//   node hub-card.js review (<id> | --card <md>) --pr <url> [--branch <b>] -> Code review
+//   node hub-card.js done   (<id> | --card <md>) [--hours N] [--resumo <md>] [--pr <url>] -> Concluído
+//   node hub-card.js describe <id> --md <arquivo>            acrescenta/substitui a seção "🤖 Situação do backend"
+//                                                            no fim da Descrição (o texto do PM é preservado)
+//
+// Opções comuns: --dry-run (não chama o Azure, mostra o que faria), --plan <arquivo> (padrão:
+// "<pasta atual>/Claude outputs/plano-cards.md"), --force (permite mexer em card já Concluído).
+// O .env é lido da pasta deste script; o PAT nunca é impresso.
+'use strict';
+const path = require('path');
+const fs = require('fs');
+require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
+const axios = require('axios');
+
+const { AZURE_DEVOPS_ORG: ORG, AZURE_DEVOPS_PROJECT: PROJECT, AZURE_DEVOPS_PAT: PAT, TARGET_EPIC_ID: EPIC } = process.env;
+const API = '7.0';
+const BASE = `https://dev.azure.com/${ORG}/${encodeURIComponent(PROJECT || '')}/_apis`;
+const TYPE = 'Task Code';
+const STATE = { start: 'Codificação', review: 'Code review', done: 'Concluído' };
+const TAG = 'Hub-Agente';
+const PATCH = { headers: { 'Content-Type': 'application/json-patch+json' } };
+
+// ---------- utilidades ----------
+function fail(msg) { console.error(`❌ ${msg}`); process.exit(1); }
+function warn(msg) { console.warn(`⚠️  ${msg}`); }
+function req(v, name) { if (v === undefined || v === true || v === '') fail(`Informe ${name}.`); return v; }
+function parseArgs(argv) {
+  const pos = [], opt = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const n = argv[i + 1];
+      if (n === undefined || n.startsWith('--')) opt[a.slice(2)] = true; else { opt[a.slice(2)] = n; i++; }
+    } else pos.push(a);
+  }
+  return { pos, opt };
+}
+let _ax;
+function ax() {
+  if (!ORG || !PROJECT || !PAT) fail('Configure AZURE_DEVOPS_ORG, AZURE_DEVOPS_PROJECT e AZURE_DEVOPS_PAT no .env do azure-worker.');
+  if (!_ax) _ax = axios.create({ headers: { Authorization: 'Basic ' + Buffer.from(':' + PAT).toString('base64') } });
+  return _ax;
+}
+function apiError(e) {
+  const s = e.response?.status;
+  const m = e.response?.data?.message || e.message;
+  if (s === 401 || s === 203) return `Azure recusou a autenticação (${s}): confira o PAT (Work Items: Read & write).`;
+  return `Azure ${s || ''} ${m}`.trim();
+}
+async function getItem(id, fields) {
+  const f = fields ? `&fields=${fields.join(',')}` : '';
+  const r = await ax().get(`${BASE}/wit/workitems/${id}?api-version=${API}${f}`);
+  return r.data;
+}
+function splitTags(raw) { return String(raw || '').split(';').map(t => t.trim()).filter(Boolean); }
+function today() { return new Date().toISOString().slice(0, 10); }
+
+// ---------- markdown -> HTML (o suficiente para os nossos cards) ----------
+function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function inline(s) {
+  return s.split(/(`[^`]+`)/).map(p =>
+    p.length > 1 && p.startsWith('`') && p.endsWith('`')
+      ? `<code>${esc(p.slice(1, -1))}</code>`
+      : esc(p).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2">$1</a>'),
+  ).join('');
+}
+function table(rows) {
+  const cells = r => r.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => inline(c.trim()));
+  const body = rows.filter(r => !/^\s*\|?\s*:?-{3,}/.test(r));
+  const [head, ...rest] = body;
+  const th = cells(head).map(c => `<th>${c}</th>`).join('');
+  const trs = rest.map(r => `<tr>${cells(r).map(c => `<td>${c}</td>`).join('')}</tr>`).join('');
+  return `<table border="1" cellpadding="4"><tr>${th}</tr>${trs}</table>`;
+}
+function mdToHtml(md) {
+  const lines = md.replace(/\r\n/g, '\n').split('\n');
+  const out = []; let para = []; const list = [];
+  const flush = () => { if (para.length) { out.push(`<p>${inline(para.join(' '))}</p>`); para = []; } };
+  const close = (ind = -1) => { while (list.length && list[list.length - 1].indent > ind) out.push(`</li></${list.pop().tag}>`); };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^```/.test(line.trim())) {
+      flush(); close(); const code = []; i++;
+      while (i < lines.length && !/^```/.test(lines[i].trim())) code.push(lines[i++]);
+      out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`); continue;
+    }
+    if (!line.trim()) { flush(); continue; }
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { flush(); close(); const l = Math.min(6, h[1].length + 2); out.push(`<h${l}>${inline(h[2])}</h${l}>`); continue; }
+    if (/^\s*\|/.test(line)) {
+      flush(); close(); const rows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(lines[i++]);
+      i--; out.push(table(rows)); continue;
+    }
+    const li = line.match(/^(\s*)([-*]|\d+\.)\s+(.*)$/);
+    if (li) {
+      flush(); const ind = li[1].length; const tag = /\d/.test(li[2]) ? 'ol' : 'ul';
+      const top = list[list.length - 1];
+      if (!top || ind > top.indent) { out.push(`<${tag}><li>${inline(li[3])}`); list.push({ indent: ind, tag }); continue; }
+      close(ind);
+      const t = list[list.length - 1];
+      if (t && t.indent === ind && t.tag === tag) out.push(`</li><li>${inline(li[3])}`);
+      else {
+        if (t && t.indent === ind) out.push(`</li></${list.pop().tag}>`); out.push(`<${tag}><li>${inline(li[3])}`); list.push({ indent: ind, tag }); }
+      continue;
+    }
+    if (list.length && /^\s+/.test(line)) { out.push(' ' + inline(line.trim())); continue; }
+    const bq = line.match(/^>\s?(.*)$/);
+    if (bq) { flush(); close(); out.push(`<blockquote>${inline(bq[1])}</blockquote>`); continue; }
+    close(); para.push(line.trim());
+  }
+  flush(); close();
+  return out.join('\n');
+}
+
+// ---------- nosso card (.md com front matter) ----------
+function readCard(file) {
+  const full = path.resolve(file);
+  if (!fs.existsSync(full)) fail(`Card não encontrado: ${full}`);
+  const raw = fs.readFileSync(full, 'utf8').replace(/^﻿/, '').replace(/\r\n/g, '\n');
+  const fm = {}; let body = raw;
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n?/);
+  if (m) {
+    body = raw.slice(m[0].length);
+    for (const l of m[1].split('\n')) {
+      const kv = l.match(/^([A-Za-z_]+):\s*(.*)$/);
+      if (kv) fm[kv[1]] = kv[2].replace(/^["']|["']$/g, '').trim();
+    }
+  }
+  const title = fm.title || (body.match(/^#\s+(.*)$/m) || [])[1] || path.basename(full, '.md');
+  const cm = title.match(/^Card\s+(\S+)\s+[—–-]\s+(.*)$/i);
+  return { full, raw, body, fm, title, code: cm ? cm[1] : '', name: cm ? cm[2] : title, azure: fm.azure ? Number(fm.azure) : null };
+}
+function writeCardAzure(card, id) {
+  let raw = card.raw;
+  const m = raw.match(/^---\n([\s\S]*?)\n---/);
+  if (m) {
+    const inner = /^azure:.*$/m.test(m[1]) ? m[1].replace(/^azure:.*$/m, `azure: ${id}`) : `${m[1]}\nazure: ${id}`;
+    raw = raw.replace(m[0], `---\n${inner}\n---`);
+  } else raw = `---\nazure: ${id}\n---\n\n${raw}`;
+  fs.writeFileSync(card.full, raw, 'utf8');
+  console.log(`📝 ${path.basename(card.full)}: azure: ${id}`);
+}
+function splitCard(body) {
+  const parts = body.split(/\n(?=#\s)/);
+  const isAcc = p => /^#\s+(\d+\.\s*)?(crit[ée]rios?\s+de\s+aceite|testes)/im.test(p.trim().split('\n')[0]);
+  return {
+    description: mdToHtml(parts.filter(p => !isAcc(p)).join('\n')),
+    acceptance: mdToHtml(parts.filter(isAcc).join('\n')),
+  };
+}
+
+// ---------- plano de cards ----------
+function upsertPlan(opt, row) {
+  const file = opt.plan ? path.resolve(opt.plan) : path.resolve(process.cwd(), 'Claude outputs', 'plano-cards.md');
+  if (!fs.existsSync(path.dirname(file))) { warn(`Plano não atualizado: a pasta ${path.dirname(file)} não existe (use --plan).`); return; }
+  const head = ['| Card | Azure | Título | Branch | Status | PR | Atualizado |', '| --- | --- | --- | --- | --- | --- | --- |'];
+  let lines = fs.existsSync(file)
+    ? fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n').split('\n')
+    : ['# Plano de cards — backend × Azure DevOps', '', 'Atualizado pelo `hub-card.js` (azure-worker). Uma linha por card; a coluna Azure é a chave.', '', ...head];
+  if (!lines.some(l => l.startsWith('| Card | Azure'))) lines.push('', ...head);
+  const cols = l => l.split('|').slice(1, -1).map(c => c.trim());
+  const idx = lines.findIndex(l => l.startsWith('|') && cols(l)[1] === String(row.azure));
+  const keys = ['card', 'azure', 'title', 'branch', 'status', 'pr'];
+  const cur = {};
+  if (idx >= 0) cols(lines[idx]).forEach((v, i) => { if (keys[i]) cur[keys[i]] = v; });
+  const merged = { ...cur };
+  for (const k of keys) if (row[k] !== undefined && row[k] !== null && row[k] !== '') merged[k] = String(row[k]);
+  const cell = s => String(s || '').replace(/\|/g, '/').replace(/\n/g, ' ');
+  const line = `| ${keys.map(k => cell(merged[k])).join(' | ')} | ${today()} |`;
+  if (idx >= 0) lines[idx] = line;
+  else {
+    let last = -1; lines.forEach((l, i) => { if (l.startsWith('|')) last = i; });
+    lines.splice(last + 1, 0, line);
+  }
+  fs.writeFileSync(file, lines.join('\n').replace(/\n*$/, '\n'), 'utf8');
+  console.log(`🗂️  Plano atualizado: ${path.relative(process.cwd(), file) || file} (${merged.card || '-'} / ${merged.azure} → ${merged.status})`);
+}
+
+// ---------- comandos ----------
+async function cmdFeatures(opt) {
+  const epic = Number(opt.epic || EPIC);
+  if (!epic) fail('Informe --epic ou TARGET_EPIC_ID no .env.');
+  const w = await ax().post(`${BASE}/wit/wiql?api-version=${API}`, {
+    query: `SELECT [System.Id] FROM WorkItemLinks WHERE ([Source].[System.Id] = ${epic} AND [System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward') MODE (Recursive)`,
+  });
+  const ids = [...new Set((w.data.workItemRelations || []).map(r => r.target?.id).filter(Boolean))].filter(id => id !== epic);
+  const items = [];
+  for (let i = 0; i < ids.length; i += 200) {
+    const r = await ax().get(`${BASE}/wit/workitems?ids=${ids.slice(i, i + 200).join(',')}&fields=System.Id,System.WorkItemType,System.State,System.Title,System.Parent&api-version=${API}`);
+    items.push(...r.data.value);
+  }
+  const kids = {};
+  items.forEach(x => { const p = x.fields['System.Parent']; if (p && x.fields['System.WorkItemType'] === TYPE) kids[p] = (kids[p] || 0) + 1; });
+  const parents = items.filter(x => x.fields['System.WorkItemType'] !== TYPE).sort((a, b) => a.id - b.id);
+  console.log(`Épico ${epic}: ${parents.length} itens pai, ${items.length - parents.length} Task Codes\n`);
+  for (const x of parents) {
+    const f = x.fields;
+    console.log(`${x.id} | ${f['System.WorkItemType']} | ${f['System.State']} | ${kids[x.id] || 0} task codes | ${f['System.Title']}`);
+  }
+}
+
+async function cmdGet(id) {
+  const it = await getItem(id, ['System.Id', 'System.WorkItemType', 'System.State', 'System.Title', 'System.Parent', 'System.Tags', 'System.AreaPath', 'System.IterationPath', 'Microsoft.VSTS.Scheduling.CompletedWork']);
+  const f = it.fields;
+  console.log(`${id} | ${f['System.WorkItemType']} | ${f['System.State']} | ${f['System.Title']}`);
+  console.log(`Área: ${f['System.AreaPath']} | Iteração: ${f['System.IterationPath']} | Horas: ${f['Microsoft.VSTS.Scheduling.CompletedWork'] ?? '-'} | Tags: ${f['System.Tags'] || '-'}`);
+  if (f['System.Parent']) {
+    const p = await getItem(f['System.Parent'], ['System.WorkItemType', 'System.Title']);
+    console.log(`Pai: ${f['System.Parent']} | ${p.fields['System.WorkItemType']} | ${p.fields['System.Title']}`);
+  }
+}
+
+async function cmdCreate(opt) {
+  const card = readCard(req(opt.card, '--card'));
+  if (card.azure && !opt.force) fail(`O card já tem azure: ${card.azure}. Use start/review/done (ou --force para criar outro).`);
+  const title = opt.title || `Back — ${card.code ? card.code + ' ' : ''}${card.name}`;
+  if (!/^back\b/i.test(title) || /front/i.test(title)) warn('O título deve começar com "Back" e não conter "front", senão o worker.js não captura o card.');
+  const { description, acceptance } = splitCard(card.body);
+  if (opt.preview) { fs.writeFileSync(path.resolve(opt.preview), `<h2>${esc(title)}</h2>${description}<hr><h2>Critérios</h2>${acceptance}`, 'utf8'); console.log(`👀 Prévia HTML: ${opt.preview}`); }
+
+  let parent = opt.parent ? Number(opt.parent) : null;
+  if (!parent && !opt.like) fail('Informe --parent <id da feature> ou --like <id de um Task Code da mesma feature>.');
+  if (opt['dry-run']) {
+    console.log(`[dry-run] criaria ${TYPE}: "${title}"`);
+    console.log(`[dry-run] pai: ${parent || `o mesmo de ${opt.like}`} | área/iteração herdadas do pai | tag ${TAG}${opt.assign ? ` | responsável ${opt.assign}` : ''}`);
+    console.log(`[dry-run] descrição ${description.length} chars | critérios ${acceptance.length} chars`);
+    console.log(`[dry-run] gravaria azure: <id> em ${path.basename(card.full)} e a linha no plano`);
+    return;
+  }
+  if (!parent) {
+    const like = await getItem(opt.like, ['System.Parent']);
+    parent = like.fields['System.Parent'];
+    if (!parent) fail(`O card ${opt.like} não tem pai.`);
+  }
+  const p = await getItem(parent, ['System.WorkItemType', 'System.Title', 'System.AreaPath', 'System.IterationPath']);
+  if (p.fields['System.WorkItemType'] === TYPE) fail(`${parent} é um ${TYPE}; o pai deve ser a feature/PBI.`);
+  console.log(`Pai: ${parent} | ${p.fields['System.WorkItemType']} | ${p.fields['System.Title']}`);
+
+  const ops = [
+    { op: 'add', path: '/fields/System.Title', value: title },
+    { op: 'add', path: '/fields/System.Description', value: description },
+    { op: 'add', path: '/fields/System.AreaPath', value: p.fields['System.AreaPath'] },
+    { op: 'add', path: '/fields/System.IterationPath', value: p.fields['System.IterationPath'] },
+    { op: 'add', path: '/fields/System.Tags', value: TAG },
+    { op: 'add', path: '/fields/System.History', value: `🤖 Agente: card ${esc(card.code || card.name)} criado a partir do plano de cards do backend.` },
+    { op: 'add', path: '/relations/-', value: { rel: 'System.LinkTypes.Hierarchy-Reverse', url: `https://dev.azure.com/${ORG}/_apis/wit/workItems/${parent}` } },
+  ];
+  if (acceptance) ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Common.AcceptanceCriteria', value: acceptance });
+  if (opt.assign) ops.push({ op: 'add', path: '/fields/System.AssignedTo', value: opt.assign });
+  const r = await ax().post(`${BASE}/wit/workitems/$${encodeURIComponent(TYPE)}?api-version=${API}`, ops, PATCH);
+  const id = r.data.id;
+  console.log(`✅ Criado ${TYPE} ${id}: ${title}`);
+  writeCardAzure(card, id);
+  upsertPlan(opt, { card: card.code || card.name, azure: id, title, status: r.data.fields['System.State'] });
+}
+
+async function cmdLink(id, opt) {
+  const card = readCard(req(opt.card, '--card'));
+  let title = card.title, state = '';
+  if (!opt['dry-run']) {
+    const it = await getItem(id, ['System.WorkItemType', 'System.Title', 'System.State']);
+    if (it.fields['System.WorkItemType'] !== TYPE) warn(`${id} é ${it.fields['System.WorkItemType']}, não ${TYPE}.`);
+    title = it.fields['System.Title']; state = it.fields['System.State'];
+    console.log(`🔗 ${id} | ${state} | ${title}`);
+  } else console.log(`[dry-run] ligaria ${id} ao card ${card.code || card.name}`);
+  if (opt['dry-run']) return;
+  writeCardAzure(card, id);
+  upsertPlan(opt, { card: card.code || card.name, azure: id, title, status: state });
+}
+
+async function cmdTransition(cmd, id, opt, card) {
+  const target = STATE[cmd];
+  if (cmd === 'review') req(opt.pr, '--pr <link do PR>');
+  const hours = opt.hours !== undefined ? Number(String(opt.hours).replace(',', '.')) : null;
+  if (hours !== null && (!Number.isFinite(hours) || hours < 0)) fail('--hours deve ser um número ≥ 0.');
+  const resumo = opt.resumo ? mdToHtml(fs.readFileSync(path.resolve(opt.resumo), 'utf8')) : '';
+  const label = card?.code ? ` (card ${esc(card.code)})` : '';
+  const bits = [];
+  if (opt.branch) bits.push(`branch <code>${esc(String(opt.branch))}</code>`);
+  if (opt.pr) bits.push(`PR <a href="${esc(String(opt.pr))}">${esc(String(opt.pr))}</a>`);
+  if (hours !== null) bits.push(`${hours}h registradas`);
+  const msg = { start: 'início da implementação', review: 'PR aberto, em code review', done: 'card concluído' }[cmd];
+  const history = `🤖 Agente: ${msg}${label}${bits.length ? ' — ' + bits.join(' · ') : ''}.${resumo ? '<br>' + resumo : ''}`;
+
+  let current = '?', tags = [], title = card?.title || '';
+  if (!opt['dry-run']) {
+    const it = await getItem(id, ['System.State', 'System.Tags', 'System.Title']);
+    current = it.fields['System.State']; tags = splitTags(it.fields['System.Tags']); title = it.fields['System.Title'];
+    if (current === STATE.done && !opt.force) fail(`${id} já está Concluído. Use --force se for intencional.`);
+    if (current === 'Cancelado' && !opt.force) fail(`${id} está Cancelado. Use --force se for intencional.`);
+  }
+  const ops = [];
+  if (current !== target) ops.push({ op: 'add', path: '/fields/System.State', value: target });
+  if (!tags.includes(TAG)) ops.push({ op: 'add', path: '/fields/System.Tags', value: [...tags, TAG].join('; ') });
+  if (hours !== null) ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.CompletedWork', value: hours });
+  ops.push({ op: 'add', path: '/fields/System.History', value: history });
+
+  if (opt['dry-run']) {
+    console.log(`[dry-run] ${id}: estado → ${target}${hours !== null ? ` | horas ${hours}` : ''}`);
+    console.log(`[dry-run] histórico: ${history.replace(/<[^>]+>/g, '').slice(0, 300)}`);
+    return;
+  }
+  await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
+  console.log(`✅ ${id}: ${current} → ${target}${hours !== null ? ` | ${hours}h` : ''}`);
+  upsertPlan(opt, { card: card?.code || card?.name, azure: id, title, branch: opt.branch, status: target, pr: opt.pr });
+}
+
+const SITUACAO = '🤖 Situação do backend';
+async function cmdDescribe(id, opt) {
+  const file = path.resolve(req(opt.md, '--md <arquivo>'));
+  if (!fs.existsSync(file)) fail(`Arquivo não encontrado: ${file}`);
+  const md = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
+  const block = `<h3>${SITUACAO} (${today()})</h3>\n${mdToHtml(md)}`;
+  if (opt.preview) { fs.writeFileSync(path.resolve(opt.preview), block, 'utf8'); console.log(`👀 Prévia HTML: ${opt.preview}`); }
+  if (opt['dry-run']) {
+    console.log(`[dry-run] ${id}: substituiria/acrescentaria a seção "${SITUACAO}" (${block.length} chars) no fim da Descrição; estado e critérios não mudam`);
+    return;
+  }
+  const it = await getItem(id, ['System.Description', 'System.Title', 'System.State', 'System.Tags']);
+  const cur = it.fields['System.Description'] || '';
+  const re = new RegExp(`<h3[^>]*>\\s*${SITUACAO}[\\s\\S]*$`);
+  const kept = cur.replace(re, '').trimEnd();
+  const replaced = kept.length !== cur.trimEnd().length;
+  const tags = splitTags(it.fields['System.Tags']);
+  const ops = [
+    { op: 'add', path: '/fields/System.Description', value: `${kept}${kept ? '\n' : ''}${block}` },
+    { op: 'add', path: '/fields/System.History', value: `🤖 Agente: seção "${SITUACAO}" ${replaced ? 'atualizada' : 'adicionada'} na descrição.` },
+  ];
+  if (!tags.includes(TAG)) ops.push({ op: 'add', path: '/fields/System.Tags', value: [...tags, TAG].join('; ') });
+  await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
+  console.log(`✅ ${id} | ${it.fields['System.State']} | ${it.fields['System.Title']}: seção ${replaced ? 'atualizada' : 'adicionada'}`);
+}
+
+async function main() {
+  const [cmd, ...rest] = process.argv.slice(2);
+  const { pos, opt } = parseArgs(rest);
+  const idOrCard = () => {
+    const card = opt.card ? readCard(opt.card) : null;
+    const id = Number(pos[0] || card?.azure);
+    if (!id) fail('Informe o id do Azure ou --card <md> com "azure:" no cabeçalho.');
+    return { id, card };
+  };
+  switch (cmd) {
+    case 'features': return cmdFeatures(opt);
+    case 'get': return cmdGet(Number(req(pos[0], '<id>')));
+    case 'create': return cmdCreate(opt);
+    case 'link': return cmdLink(Number(req(pos[0], '<id>')), opt);
+    case 'describe': return cmdDescribe(Number(req(pos[0], '<id>')), opt);
+    case 'start': case 'review': case 'done': { const { id, card } = idOrCard(); return cmdTransition(cmd, id, opt, card); }
+    default:
+      console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 17).map(l => l.replace(/^\/\/ ?/, '')).join('\n'));
+      process.exit(cmd ? 1 : 0);
+  }
+}
+if (require.main === module) main().catch(e => fail(apiError(e)));
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan };
