@@ -8,6 +8,8 @@
 //   node hub-card.js start  (<id> | --card <md>) [--branch <b>]            -> Codificação
 //   node hub-card.js review (<id> | --card <md>) --pr <url> [--branch <b>] -> Code review
 //   node hub-card.js done   (<id> | --card <md>) [--hours N] [--resumo <md>] [--pr <url>] -> Concluído
+//                                                            (sem --hours: estima por horas úteis Codificação → Code review)
+//   node hub-card.js sync [--dry-run]                        fecha (done) os cards do plano cuja branch já está mergeada na origin/main
 //   node hub-card.js reparent <id> (--parent <id> | --like <taskId>) move o card para outro pai (e área/iteração)
 //   node hub-card.js describe <id> --md <arquivo>            acrescenta/substitui a seção "🤖 Situação do backend"
 //                                                            no fim da Descrição (o texto do PM é preservado)
@@ -20,6 +22,7 @@ const path = require('path');
 const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
 const axios = require('axios');
+const { execSync } = require('child_process');
 
 const { AZURE_DEVOPS_ORG: ORG, AZURE_DEVOPS_PROJECT: PROJECT, AZURE_DEVOPS_PAT: PAT, TARGET_EPIC_ID: EPIC } = process.env;
 const API = '7.0';
@@ -63,6 +66,110 @@ async function getItem(id, fields) {
 }
 function splitTags(raw) { return String(raw || '').split(';').map(t => t.trim()).filter(Boolean); }
 function today() { return new Date().toISOString().slice(0, 10); }
+
+// ---------- horas úteis (seg–sex, 08:00–18:00 em America/Sao_Paulo / UTC-3) ----------
+const BH_TZ_OFFSET = -3;        // America/Sao_Paulo, sem horário de verão
+const BH_START_HOUR = 8;
+const BH_END_HOUR = 18;
+function spLocalMs(y, m, day, hour) { return Date.UTC(y, m, day, hour, 0, 0, 0) - BH_TZ_OFFSET * 3600 * 1000; }
+
+// Horas úteis entre dois instantes (Date ou ISO). Retorna 0 se fim <= início.
+function businessHoursBetween(startInput, endInput) {
+  const start = new Date(startInput).getTime();
+  const end = new Date(endInput).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+  const s = new Date(start + BH_TZ_OFFSET * 3600 * 1000);
+  const e = new Date(end + BH_TZ_OFFSET * 3600 * 1000);
+  const cursor = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate()));
+  const last = Date.UTC(e.getUTCFullYear(), e.getUTCMonth(), e.getUTCDate());
+  let totalMs = 0;
+  while (cursor.getTime() <= last) {
+    const dow = cursor.getUTCDay();
+    if (dow !== 0 && dow !== 6) {
+      const ws = spLocalMs(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate(), BH_START_HOUR);
+      const we = spLocalMs(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate(), BH_END_HOUR);
+      const os = Math.max(start, ws);
+      const oe = Math.min(end, we);
+      if (oe > os) totalMs += oe - os;
+    }
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return totalMs / 3600000;
+}
+
+// Horas estimadas: horas úteis arredondadas para 0,5, com mínimo de 0,5.
+function estimatedHoursHalfUp(startInput, endInput) {
+  return Math.max(0.5, Math.round(businessHoursBetween(startInput, endInput) * 2) / 2);
+}
+
+// ---------- git (somente leitura, no repositório atual) ----------
+function git(args, cwd) {
+  return execSync(`git ${args}`, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+}
+function gitOk(args, cwd) {
+  try { git(args, cwd); return true; } catch { return false; }
+}
+
+// Histórico de revisões do card no Azure (para achar Codificação / Code review).
+async function getUpdates(id) {
+  const r = await ax().get(`${BASE}/wit/workItems/${id}/updates?api-version=${API}`);
+  return r.data.value || [];
+}
+
+// Horas estimadas de um card: Codificação → Code review (ou último commit da branch).
+async function estimateDoneHours(id, branch) {
+  const updates = await getUpdates(id);
+  const stateOf = u => (u.fields && u.fields['System.State'] && u.fields['System.State'].newValue) || null;
+  const start = updates.find(u => stateOf(u) === STATE.start);
+  if (!start) throw new Error(`Sem data de início ("${STATE.start}") no histórico do card ${id}; informe --hours.`);
+  const startDate = start.revisedDate;
+  const review = updates.find(u => stateOf(u) === STATE.review && new Date(u.revisedDate) >= new Date(startDate));
+  let endDate;
+  if (review) endDate = review.revisedDate;
+  else {
+    if (!branch) throw new Error(`Sem "${STATE.review}" no histórico e sem branch para ${id}; informe --hours.`);
+    endDate = git(`log -1 --format=%cI ${branch}`, process.cwd());
+  }
+  return { hours: estimatedHoursHalfUp(startDate, endDate), startDate, endDate, source: review ? 'review' : 'commit' };
+}
+
+// ---------- plano de cards + detecção de merge ----------
+function planPath(opt) {
+  return opt.plan ? path.resolve(opt.plan) : path.resolve(process.cwd(), 'Claude outputs', 'plano-cards.md');
+}
+function readPlanRows(file) {
+  if (!fs.existsSync(file)) return [];
+  const rows = [];
+  for (const l of fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n').split('\n')) {
+    if (!l.startsWith('|')) continue;
+    const cols = l.split('|').slice(1, -1).map(c => c.trim());
+    if (cols.length < 7 || cols[0] === 'Card' || /^:?-{3,}/.test(cols[1])) continue;
+    rows.push({ card: cols[0], azure: cols[1], title: cols[2], branch: cols[3], status: cols[4], pr: cols[5] });
+  }
+  return rows;
+}
+function planBranchFor(id, opt) {
+  const row = readPlanRows(planPath(opt)).find(r => String(r.azure) === String(id));
+  return row && row.branch ? row.branch : null;
+}
+
+// A branch foi mergeada na mainRef? Por ancestralidade ou pelo assunto do commit (squash / branch apagada).
+function detectMerged(cwd, branch, code, mainRef = 'origin/main') {
+  let ref = null;
+  if (branch && gitOk(`rev-parse --verify --quiet origin/${branch}`, cwd)) ref = `origin/${branch}`;
+  else if (branch && gitOk(`rev-parse --verify --quiet ${branch}`, cwd)) ref = branch;
+  if (ref && gitOk(`merge-base --is-ancestor ${ref} ${mainRef}`, cwd)) {
+    // Branch no mesmo ponto da main = recém-criada, sem commits próprios: não é merge.
+    if (git(`rev-parse ${ref}`, cwd) !== git(`rev-parse ${mainRef}`, cwd)) return { merged: true, reason: 'ancestor', ref };
+  }
+  const subjects = git(`log ${mainRef} --format=%s -n 1000`, cwd).split('\n');
+  const nb = branch ? branch.toLowerCase() : null;
+  const nc = code ? `(${code.toLowerCase()})` : null;
+  const hit = subjects.find(s => { const t = s.toLowerCase(); return (nb && t.includes(nb)) || (nc && t.includes(nc)); });
+  if (hit) return { merged: true, reason: 'subject', ref, subject: hit };
+  return { merged: false, ref };
+}
+function fmtHours(h) { return `${String(h).replace('.', ',')}h`; }
 
 // ---------- markdown -> HTML (o suficiente para os nossos cards) ----------
 function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
@@ -310,16 +417,27 @@ async function cmdLink(id, opt) {
 }
 
 async function cmdTransition(cmd, id, opt, card) {
-  const target = STATE[cmd];
   if (cmd === 'review') req(opt.pr, '--pr <link do PR>');
-  const hours = opt.hours !== undefined ? Number(String(opt.hours).replace(',', '.')) : null;
+  let hours = opt.hours !== undefined ? Number(String(opt.hours).replace(',', '.')) : null;
+  let estimated = false;
+  if (cmd === 'done' && hours === null) {
+    const branch = opt.branch || planBranchFor(id, opt);
+    const est = await estimateDoneHours(id, branch);
+    hours = est.hours;
+    estimated = true;
+  }
   if (hours !== null && (!Number.isFinite(hours) || hours < 0)) fail('--hours deve ser um número ≥ 0.');
+  return applyTransition(cmd, id, opt, card, hours, estimated);
+}
+
+async function applyTransition(cmd, id, opt, card, hours, estimated) {
+  const target = STATE[cmd];
   const resumo = opt.resumo ? mdToHtml(fs.readFileSync(path.resolve(opt.resumo), 'utf8')) : '';
   const label = card?.code ? ` (card ${esc(card.code)})` : '';
   const bits = [];
   if (opt.branch) bits.push(`branch <code>${esc(String(opt.branch))}</code>`);
   if (opt.pr) bits.push(`PR <a href="${esc(String(opt.pr))}">${esc(String(opt.pr))}</a>`);
-  if (hours !== null) bits.push(`${hours}h registradas`);
+  if (hours !== null) bits.push(estimated ? `${hours}h estimadas (Codificação → Code review, horas úteis)` : `${hours}h registradas`);
   const msg = { start: 'início da implementação', review: 'PR aberto, em code review', done: 'card concluído' }[cmd];
   const history = `🤖 Agente: ${msg}${label}${bits.length ? ' — ' + bits.join(' · ') : ''}.${resumo ? '<br>' + resumo : ''}`;
 
@@ -395,6 +513,28 @@ async function cmdDescribe(id, opt) {
   console.log(`✅ ${id} | ${it.fields['System.State']} | ${it.fields['System.Title']}: seção ${replaced ? 'atualizada' : 'adicionada'}`);
 }
 
+async function cmdSync(opt) {
+  const cwd = process.cwd();
+  const file = planPath(opt);
+  if (!fs.existsSync(file)) fail(`Plano não encontrado: ${file}`);
+  try { git('fetch origin', cwd); } catch (e) { warn(`git fetch origin falhou: ${String(e.message).split('\n')[0]}`); }
+  const rows = readPlanRows(file).filter(r => (r.status === STATE.start || r.status === STATE.review) && r.branch);
+  console.log(`sync${opt['dry-run'] ? ' (dry-run)' : ''}: ${rows.length} card(s) em andamento em ${path.basename(file)}\n`);
+  for (const row of rows) {
+    try {
+      const det = detectMerged(cwd, row.branch, row.card);
+      if (!det.merged) { console.log(`${row.card} | ${row.azure} | aberto | -`); continue; }
+      const { hours } = await estimateDoneHours(row.azure, det.ref || row.branch);
+      if (opt['dry-run']) { console.log(`${row.card} | ${row.azure} | mergeado (${det.reason}) | ${fmtHours(hours)} | marcaria Concluído`); continue; }
+      const card = { code: row.card, name: row.title, title: row.title };
+      await applyTransition('done', Number(row.azure), { ...opt, branch: row.branch }, card, hours, true);
+      console.log(`${row.card} | ${row.azure} | mergeado (${det.reason}) | ${fmtHours(hours)} | Concluído`);
+    } catch (e) {
+      console.error(`${row.card} | ${row.azure} | erro: ${String(e.message).split('\n')[0]}`);
+    }
+  }
+}
+
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const { pos, opt } = parseArgs(rest);
@@ -411,11 +551,12 @@ async function main() {
     case 'link': return cmdLink(Number(req(pos[0], '<id>')), opt);
     case 'reparent': return cmdReparent(Number(req(pos[0], '<id>')), opt);
     case 'describe': return cmdDescribe(Number(req(pos[0], '<id>')), opt);
+    case 'sync': return cmdSync(opt);
     case 'start': case 'review': case 'done': { const { id, card } = idOrCard(); return cmdTransition(cmd, id, opt, card); }
     default:
       console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 17).map(l => l.replace(/^\/\/ ?/, '')).join('\n'));
       process.exit(cmd ? 1 : 0);
   }
 }
-if (require.main === module) main().catch(e => fail(apiError(e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan };
+if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, businessHoursBetween, estimatedHoursHalfUp, detectMerged, readPlanRows };
