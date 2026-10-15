@@ -579,7 +579,9 @@ async function applyTransition(cmd, id, opt, card, hours) {
   }
   await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
   console.log(`✅ ${id}: ${current} → ${target}${hours !== null ? ` | ${hours}h` : ''}`);
-  upsertPlan(opt, { card: card?.code || card?.name, azure: id, title, branch: opt.branch, status: target, pr: opt.pr });
+  const planRow = { card: card?.code || card?.name, azure: id, title, branch: opt.branch, status: target, pr: opt.pr };
+  if (cmd === 'done' && hours !== null) planRow.hours = hours;
+  upsertPlan(opt, planRow);
 }
 
 async function cmdReparent(id, opt) {
@@ -662,7 +664,9 @@ async function cmdSync(opt) {
     try {
       const det = detectMerged(cwd, row.branch, row.card);
       if (!det.merged) { console.log(`${row.card} | ${row.azure} | aberto | -`); continue; }
-      const est = await estimateDoneHours(row.azure, det.ref || row.branch);
+      // Prefere a branch local (tem reflog); só usa a ref remota se a local não existir.
+      const gitRef = gitOk(`rev-parse --verify --quiet ${row.branch}`, cwd) ? row.branch : (det.ref || row.branch);
+      const est = await estimateDoneHours(row.azure, gitRef);
       if (opt['dry-run']) { console.log(`${row.card} | ${row.azure} | mergeado (${det.reason}) | ${fmtHours(est.hours)} | marcaria Concluído`); continue; }
       const card = { code: row.card, name: row.title, title: row.title };
       await applyTransition('done', Number(row.azure), { ...opt, branch: row.branch }, card, est.hours);
