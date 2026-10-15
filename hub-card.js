@@ -8,6 +8,7 @@
 //   node hub-card.js start  (<id> | --card <md>) [--branch <b>]            -> Codificação
 //   node hub-card.js review (<id> | --card <md>) --pr <url> [--branch <b>] -> Code review
 //   node hub-card.js done   (<id> | --card <md>) [--hours N] [--resumo <md>] [--pr <url>] -> Concluído
+//   node hub-card.js reparent <id> (--parent <id> | --like <taskId>) move o card para outro pai (e área/iteração)
 //   node hub-card.js describe <id> --md <arquivo>            acrescenta/substitui a seção "🤖 Situação do backend"
 //                                                            no fim da Descrição (o texto do PM é preservado)
 //
@@ -185,6 +186,39 @@ function upsertPlan(opt, row) {
   console.log(`🗂️  Plano atualizado: ${path.relative(process.cwd(), file) || file} (${merged.card || '-'} / ${merged.azure} → ${merged.status})`);
 }
 
+async function ancestry(id) {
+  const chain = [];
+  let cur = Number(id);
+  for (let i = 0; i < 8 && cur; i++) {
+    const it = await getItem(cur, ['System.WorkItemType', 'System.Title', 'System.Parent', 'System.AreaPath', 'System.IterationPath']);
+    chain.push({ id: cur, type: it.fields['System.WorkItemType'], title: it.fields['System.Title'], area: it.fields['System.AreaPath'], iteration: it.fields['System.IterationPath'] });
+    cur = it.fields['System.Parent'];
+  }
+  return chain;
+}
+function fmtChain(chain) { return chain.map(c => `${c.id} (${c.type})`).join(' → '); }
+// Resolve o pai e a área/iteração: com --like, copia do Task Code irmão (é o que garante o mesmo board);
+// sem --like, herda do pai. Exige que o pai esteja sob o épico TARGET_EPIC_ID (salvo --any-epic).
+async function resolvePlacement(opt) {
+  let like = null, parent = opt.parent ? Number(opt.parent) : null;
+  if (opt.like) {
+    const l = await getItem(opt.like, ['System.WorkItemType', 'System.Parent', 'System.AreaPath', 'System.IterationPath']);
+    like = l.fields;
+    if (!parent) parent = like['System.Parent'];
+    if (!parent) fail(`O card ${opt.like} não tem pai.`);
+  }
+  if (!parent) fail('Informe --parent <id> ou --like <id de um Task Code da mesma feature>.');
+  const chain = await ancestry(parent);
+  if (chain[0].type === TYPE) fail(`${parent} é um ${TYPE}; o pai deve ser a feature/requirement.`);
+  const epic = Number(opt.epic || EPIC);
+  if (epic && !chain.some(c => c.id === epic) && !opt['any-epic']) {
+    fail(`O pai ${parent} não está no épico ${epic}: ${fmtChain(chain)}. Use --like <Task Code do board certo> ou --parent de uma feature do épico.`);
+  }
+  const area = opt.area || (like ? like['System.AreaPath'] : chain[0].area);
+  const iteration = opt.iteration || (like ? like['System.IterationPath'] : chain[0].iteration);
+  return { parent, chain, area, iteration };
+}
+
 // ---------- comandos ----------
 async function cmdFeatures(opt) {
   const epic = Number(opt.epic || EPIC);
@@ -214,8 +248,11 @@ async function cmdGet(id) {
   console.log(`${id} | ${f['System.WorkItemType']} | ${f['System.State']} | ${f['System.Title']}`);
   console.log(`Área: ${f['System.AreaPath']} | Iteração: ${f['System.IterationPath']} | Horas: ${f['Microsoft.VSTS.Scheduling.CompletedWork'] ?? '-'} | Tags: ${f['System.Tags'] || '-'}`);
   if (f['System.Parent']) {
-    const p = await getItem(f['System.Parent'], ['System.WorkItemType', 'System.Title']);
-    console.log(`Pai: ${f['System.Parent']} | ${p.fields['System.WorkItemType']} | ${p.fields['System.Title']}`);
+    const chain = await ancestry(f['System.Parent']);
+    console.log(`Pais: ${fmtChain(chain)}`);
+    chain.forEach(c => console.log(`  ${c.id} | ${c.type} | ${c.title} | ${c.area}`));
+    const epic = Number(EPIC);
+    if (epic) console.log(chain.some(c => c.id === epic) ? `✅ Dentro do épico ${epic}` : `⚠️  FORA do épico ${epic}`);
   }
 }
 
@@ -227,29 +264,24 @@ async function cmdCreate(opt) {
   const { description, acceptance } = splitCard(card.body);
   if (opt.preview) { fs.writeFileSync(path.resolve(opt.preview), `<h2>${esc(title)}</h2>${description}<hr><h2>Critérios</h2>${acceptance}`, 'utf8'); console.log(`👀 Prévia HTML: ${opt.preview}`); }
 
-  let parent = opt.parent ? Number(opt.parent) : null;
-  if (!parent && !opt.like) fail('Informe --parent <id da feature> ou --like <id de um Task Code da mesma feature>.');
+  if (!opt.parent && !opt.like) fail('Informe --parent <id da feature> ou --like <id de um Task Code da mesma feature>.');
+  if (opt['dry-run'] && !PAT) {
+    console.log(`[dry-run] criaria ${TYPE}: "${title}" (sem PAT: pai e épico não verificados)`);
+    return;
+  }
+  const { parent, chain, area, iteration } = await resolvePlacement(opt);
+  console.log(`Pai: ${fmtChain(chain)}`);
+  console.log(`Área: ${area} | Iteração: ${iteration}`);
   if (opt['dry-run']) {
-    console.log(`[dry-run] criaria ${TYPE}: "${title}"`);
-    console.log(`[dry-run] pai: ${parent || `o mesmo de ${opt.like}`} | área/iteração herdadas do pai | tag ${TAG}${opt.assign ? ` | responsável ${opt.assign}` : ''}`);
-    console.log(`[dry-run] descrição ${description.length} chars | critérios ${acceptance.length} chars`);
+    console.log(`[dry-run] criaria ${TYPE}: "${title}" | descrição ${description.length} chars | critérios ${acceptance.length} chars`);
     console.log(`[dry-run] gravaria azure: <id> em ${path.basename(card.full)} e a linha no plano`);
     return;
   }
-  if (!parent) {
-    const like = await getItem(opt.like, ['System.Parent']);
-    parent = like.fields['System.Parent'];
-    if (!parent) fail(`O card ${opt.like} não tem pai.`);
-  }
-  const p = await getItem(parent, ['System.WorkItemType', 'System.Title', 'System.AreaPath', 'System.IterationPath']);
-  if (p.fields['System.WorkItemType'] === TYPE) fail(`${parent} é um ${TYPE}; o pai deve ser a feature/PBI.`);
-  console.log(`Pai: ${parent} | ${p.fields['System.WorkItemType']} | ${p.fields['System.Title']}`);
-
   const ops = [
     { op: 'add', path: '/fields/System.Title', value: title },
     { op: 'add', path: '/fields/System.Description', value: description },
-    { op: 'add', path: '/fields/System.AreaPath', value: p.fields['System.AreaPath'] },
-    { op: 'add', path: '/fields/System.IterationPath', value: p.fields['System.IterationPath'] },
+    { op: 'add', path: '/fields/System.AreaPath', value: area },
+    { op: 'add', path: '/fields/System.IterationPath', value: iteration },
     { op: 'add', path: '/fields/System.Tags', value: TAG },
     { op: 'add', path: '/fields/System.History', value: `🤖 Agente: card ${esc(card.code || card.name)} criado a partir do plano de cards do backend.` },
     { op: 'add', path: '/relations/-', value: { rel: 'System.LinkTypes.Hierarchy-Reverse', url: `https://dev.azure.com/${ORG}/_apis/wit/workItems/${parent}` } },
@@ -314,6 +346,29 @@ async function cmdTransition(cmd, id, opt, card) {
   upsertPlan(opt, { card: card?.code || card?.name, azure: id, title, branch: opt.branch, status: target, pr: opt.pr });
 }
 
+async function cmdReparent(id, opt) {
+  const it = await ax().get(`${BASE}/wit/workitems/${id}?$expand=relations&api-version=${API}`);
+  const f = it.data.fields;
+  if (f['System.WorkItemType'] !== TYPE) fail(`${id} é ${f['System.WorkItemType']}, não ${TYPE}.`);
+  const { parent, chain, area, iteration } = await resolvePlacement(opt);
+  const rels = it.data.relations || [];
+  const idx = rels.findIndex(r => r.rel === 'System.LinkTypes.Hierarchy-Reverse');
+  const oldParent = idx >= 0 ? Number(rels[idx].url.split('/').pop()) : null;
+  console.log(`${id} | ${f['System.Title']}`);
+  console.log(`  pai: ${oldParent ?? '-'} → ${parent} (${fmtChain(chain)})`);
+  console.log(`  área: ${f['System.AreaPath']} → ${area}`);
+  console.log(`  iteração: ${f['System.IterationPath']} → ${iteration}`);
+  if (opt['dry-run']) { console.log('[dry-run] nada gravado'); return; }
+  const ops = [];
+  if (idx >= 0 && oldParent !== parent) ops.push({ op: 'remove', path: `/relations/${idx}` });
+  if (oldParent !== parent) ops.push({ op: 'add', path: '/relations/-', value: { rel: 'System.LinkTypes.Hierarchy-Reverse', url: `https://dev.azure.com/${ORG}/_apis/wit/workItems/${parent}` } });
+  ops.push({ op: 'add', path: '/fields/System.AreaPath', value: area });
+  ops.push({ op: 'add', path: '/fields/System.IterationPath', value: iteration });
+  ops.push({ op: 'add', path: '/fields/System.History', value: `🤖 Agente: card movido para o pai ${parent} (antes: ${oldParent ?? '-'}).` });
+  await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
+  console.log(`✅ ${id} movido.`);
+}
+
 const SITUACAO = '🤖 Situação do backend';
 async function cmdDescribe(id, opt) {
   const file = path.resolve(req(opt.md, '--md <arquivo>'));
@@ -354,6 +409,7 @@ async function main() {
     case 'get': return cmdGet(Number(req(pos[0], '<id>')));
     case 'create': return cmdCreate(opt);
     case 'link': return cmdLink(Number(req(pos[0], '<id>')), opt);
+    case 'reparent': return cmdReparent(Number(req(pos[0], '<id>')), opt);
     case 'describe': return cmdDescribe(Number(req(pos[0], '<id>')), opt);
     case 'start': case 'review': case 'done': { const { id, card } = idOrCard(); return cmdTransition(cmd, id, opt, card); }
     default:
