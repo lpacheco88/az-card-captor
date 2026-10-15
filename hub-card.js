@@ -8,9 +8,9 @@
 //   node hub-card.js start  (<id> | --card <md>) [--branch <b>]            -> Codificação
 //   node hub-card.js review (<id> | --card <md>) --pr <url> [--branch <b>] -> Code review
 //   node hub-card.js done   (<id> | --card <md>) [--hours N] [--resumo <md>] [--pr <url>] -> Concluído
-//                                                            (sem --hours: estima por horas úteis Codificação → Code review)
+//                                                            (sem --hours: tempo de execução × 1,5 útil / × 2,5 fim de semana)
 //   node hub-card.js sync [--dry-run]                        fecha (done) os cards do plano cuja branch já está mergeada na origin/main
-//   node hub-card.js rehours <id> [--dry-run]                recalcula as horas (regra nova) sem mudar o estado nem o CompletedWork de estado
+//   node hub-card.js rehours <id> [--dry-run]                recalcula o CompletedWork e a coluna Horas do plano, sem mudar o estado
 //   node hub-card.js reparent <id> (--parent <id> | --like <taskId>) move o card para outro pai (e área/iteração)
 //   node hub-card.js describe <id> --md <arquivo>            acrescenta/substitui a seção "🤖 Situação do backend"
 //                                                            no fim da Descrição (o texto do PM é preservado)
@@ -68,54 +68,51 @@ async function getItem(id, fields) {
 function splitTags(raw) { return String(raw || '').split(';').map(t => t.trim()).filter(Boolean); }
 function today() { return new Date().toISOString().slice(0, 10); }
 
-// ---------- janela 08:00–18:00 em America/Sao_Paulo (UTC-3), TODOS os dias ----------
+// ---------- tempo de execução (America/Sao_Paulo, UTC-3) ----------
 const BH_TZ_OFFSET = -3;        // America/Sao_Paulo, sem horário de verão
-const BH_START_HOUR = 8;
-const BH_END_HOUR = 18;
-const DEFAULT_HOURS_FACTOR = 0.5;
-function spLocalMs(y, m, day, hour) { return Date.UTC(y, m, day, hour, 0, 0, 0) - BH_TZ_OFFSET * 3600 * 1000; }
+const DEFAULT_IDLE_GAP_HOURS = 2;
 
-// Horas de janela (08:00–18:00, TODOS os dias, inclusive sábado e domingo) entre dois instantes.
-function windowHoursBetween(startInput, endInput) {
-  const start = new Date(startInput).getTime();
-  const end = new Date(endInput).getTime();
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
-  const s = new Date(start + BH_TZ_OFFSET * 3600 * 1000);
-  const e = new Date(end + BH_TZ_OFFSET * 3600 * 1000);
-  const cursor = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate()));
-  const last = Date.UTC(e.getUTCFullYear(), e.getUTCMonth(), e.getUTCDate());
-  let totalMs = 0;
-  while (cursor.getTime() <= last) {
-    const ws = spLocalMs(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate(), BH_START_HOUR);
-    const we = spLocalMs(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate(), BH_END_HOUR);
-    const os = Math.max(start, ws);
-    const oe = Math.min(end, we);
-    if (oe > os) totalMs += oe - os;
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
+// Próxima meia-noite local (SP) a partir de um instante (ms).
+function spNextMidnight(ms) {
+  const d = new Date(ms + BH_TZ_OFFSET * 3600 * 1000);
+  const midnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0) - BH_TZ_OFFSET * 3600 * 1000;
+  return midnight + 24 * 3600 * 1000;
+}
+// Dia da semana local (SP): 0=domingo … 6=sábado.
+function spDow(ms) { return new Date(ms + BH_TZ_OFFSET * 3600 * 1000).getUTCDay(); }
+
+// HUB_CARD_IDLE_GAP_HOURS: intervalo entre pontos de atividade maior que isso não conta (padrão 2h).
+function resolveIdleGap() {
+  const raw = process.env.HUB_CARD_IDLE_GAP_HOURS;
+  const h = raw === undefined || raw === '' ? DEFAULT_IDLE_GAP_HOURS : Number(String(raw).replace(',', '.'));
+  return Number.isFinite(h) && h > 0 ? h : DEFAULT_IDLE_GAP_HOURS;
+}
+
+// Minutos de atividade em dia útil e em fim de semana: soma intervalos entre pontos consecutivos,
+// ignorando intervalos maiores que o idleGap; cada intervalo é dividido nas meia-noites locais.
+function activityMinutes(points, idleGapHours) {
+  let weekdayMinutes = 0, weekendMinutes = 0;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1], b = points[i];
+    if ((b - a) / 3600000 > idleGapHours) continue;
+    let cur = a;
+    while (cur < b) {
+      const next = Math.min(spNextMidnight(cur), b);
+      const dow = spDow(cur);
+      const mins = (next - cur) / 60000;
+      if (dow === 0 || dow === 6) weekendMinutes += mins; else weekdayMinutes += mins;
+      cur = next;
+    }
   }
-  return totalMs / 3600000;
+  return { weekdayMinutes, weekendMinutes };
 }
 
-// Fator do card: padrão 0,5, trocável por HUB_CARD_HOURS_FACTOR (não vai no .env).
-function resolveHoursFactor() {
-  const raw = process.env.HUB_CARD_HOURS_FACTOR;
-  const f = raw === undefined || raw === '' ? DEFAULT_HOURS_FACTOR : Number(String(raw).replace(',', '.'));
-  return Number.isFinite(f) && f > 0 ? f : DEFAULT_HOURS_FACTOR;
-}
-
-// Horas do card = janela × fator, arredondado para 0,5, com mínimo de 0,5.
-function cardHoursFromWindow(windowHours, factor) {
-  return Math.max(0.5, Math.round(windowHours * factor * 2) / 2);
-}
-
-// --hours informado tem prioridade e NÃO recebe o fator.
-function resolveEstimatedHours(provided, windowHours, factor) {
-  if (provided !== null && provided !== undefined && provided !== '') return { hours: Number(provided), estimated: false };
-  return { hours: cardHoursFromWindow(windowHours, factor), estimated: true };
+// Horas = minutos úteis × 1,5 + minutos de fim de semana × 2,5; arredonda a 0,5 (mínimo 0,5).
+function hoursFromMinutes({ weekdayMinutes, weekendMinutes }) {
+  return Math.max(0.5, Math.round((weekdayMinutes / 60 * 1.5 + weekendMinutes / 60 * 2.5) * 2) / 2);
 }
 
 function fmtNum(n) { return String(Math.round(Number(n) * 100) / 100).replace('.', ','); }
-function fmtFactor(f) { return String(f).replace('.', ','); }
 
 // ---------- git (somente leitura, no repositório atual) ----------
 function git(args, cwd) {
@@ -133,19 +130,21 @@ async function getUpdates(id) {
 
 function isGitRepo(cwd) { return gitOk('rev-parse --is-inside-work-tree', cwd); }
 
-// Datas do git para a branch: criação (reflog mais antigo), primeiro commit após a main e último commit.
+// Datas do git para a branch: todas as entradas do reflog, 1º commit após a main e último commit.
 function branchGitDates(cwd, branch, mainRef = 'origin/main') {
-  const out = { reflogDate: null, firstCommit: null, lastCommit: null };
+  const out = { reflogDates: [], firstCommit: null, lastCommit: null };
   if (!branch) return out;
   try {
     const lines = git(`reflog show --date=iso ${branch}`, cwd).split('\n').filter(Boolean);
-    const dates = lines.map(l => (l.match(/@\{([^}]+)\}/) || [])[1]).filter(Boolean);
-    if (dates.length) {
-      const raw = dates[dates.length - 1]; // reflog é do mais novo para o mais antigo
-      const iso = raw.includes('T') ? raw : raw.replace(' ', 'T').replace(/(\d)[ ]([+-])/, '$1$2');
-      const d = new Date(iso);
-      if (!Number.isNaN(d.getTime())) out.reflogDate = d.toISOString();
-    }
+    out.reflogDates = lines
+      .map(l => (l.match(/@\{([^}]+)\}/) || [])[1])
+      .filter(Boolean)
+      .map(raw => {
+        const iso = raw.includes('T') ? raw : raw.replace(' ', 'T').replace(/(\d)[ ]([+-])/, '$1$2');
+        const d = new Date(iso);
+        return Number.isNaN(d.getTime()) ? null : d.toISOString();
+      })
+      .filter(Boolean);
   } catch { /* sem reflog (branch apagada/outra máquina) */ }
   try { out.lastCommit = git(`log -1 --format=%cI ${branch}`, cwd); } catch { /* sem branch */ }
   try {
@@ -159,45 +158,46 @@ function branchGitDates(cwd, branch, mainRef = 'origin/main') {
   return out;
 }
 
-// Escolhe início (menor) e fim (maior). Se o fim ficar antes do início, usa só os dados do git.
-function selectWindow({ azureStart, azureReview, reflogDate, firstCommit, lastCommit }) {
-  const valid = d => d && !Number.isNaN(new Date(d).getTime());
-  const pick = (pairs, cmp) => {
-    const v = pairs.filter(([d]) => valid(d));
-    if (!v.length) return [null, null];
-    v.sort((a, b) => cmp(new Date(a[0]), new Date(b[0])));
-    return v[0];
-  };
-  let [startDate, startSource] = pick([[azureStart, 'Codificação'], [reflogDate, 'reflog'], [firstCommit, 'commit']], (a, b) => a - b);
-  let [endDate, endSource] = pick([[azureReview, 'Code review'], [lastCommit, 'commit']], (a, b) => b - a);
-  if (valid(startDate) && valid(endDate) && new Date(endDate) < new Date(startDate)) {
-    const [gs, gsSrc] = pick([[reflogDate, 'reflog'], [firstCommit, 'commit']], (a, b) => a - b);
-    if (gs) { startDate = gs; startSource = gsSrc; }
-    if (lastCommit) { endDate = lastCommit; endSource = 'commit'; }
-  }
-  return { startDate, startSource, endDate, endSource };
+// Todos os commits da branch (datas), para os pontos de atividade.
+function branchCommitDates(cwd, branch) {
+  try { return git(`log --format=%cI ${branch}`, cwd).split('\n').filter(Boolean); } catch { return []; }
 }
 
-// Horas estimadas de um card: início = menor entre Codificação/reflog/1º commit; fim = maior entre Code review/último commit.
+// Tempo de execução: início = menor entre reflog (criação), Codificação (Azure) e 1º commit; fim = último commit.
+// Pontos de atividade = entradas do reflog + commits da branch; intervalos > idle não contam.
+function executionEstimate({ azureStart, reflogDates = [], commitDates = [], firstCommit, lastCommit, idleGapHours = resolveIdleGap() }) {
+  const valid = d => d && !Number.isNaN(new Date(d).getTime());
+  const ms = d => new Date(d).getTime();
+  const creation = reflogDates.length ? Math.min(...reflogDates.map(ms)) : null;
+  const cands = [];
+  if (valid(creation)) cands.push([creation, 'reflog']);
+  if (valid(azureStart)) cands.push([ms(azureStart), 'Codificação']);
+  if (valid(firstCommit)) cands.push([ms(firstCommit), 'commit']);
+  if (!cands.length) throw new Error('Sem data de início (reflog, Codificação ou commit).');
+  cands.sort((a, b) => a[0] - b[0]);
+  const [start, startSource] = cands[0];
+  if (!valid(lastCommit)) throw new Error('Sem último commit da branch.');
+  const end = ms(lastCommit);
+  const points = [...new Set([start, ...[...reflogDates, ...commitDates].map(ms), end].filter(t => t >= start && t <= end))].sort((a, b) => a - b);
+  const { weekdayMinutes, weekendMinutes } = activityMinutes(points, idleGapHours);
+  return { startDate: new Date(start).toISOString(), endDate: new Date(end).toISOString(), startSource, endSource: 'commit', weekdayMinutes, weekendMinutes, hours: hoursFromMinutes({ weekdayMinutes, weekendMinutes }) };
+}
+
+// --hours informado tem prioridade e não recebe multiplicador.
+function decidedHours(provided, estimatedHours) {
+  return provided !== null && provided !== undefined && provided !== '' ? Number(provided) : estimatedHours;
+}
+
 async function estimateDoneHours(id, branch) {
   const cwd = process.cwd();
   const inRepo = isGitRepo(cwd);
-  if (!inRepo) warn('Fora de um repositório git: usando só as datas do Azure.');
+  if (!inRepo) warn('Fora de um repositório git: sem os pontos de atividade do git.');
   const updates = await getUpdates(id);
   const stateOf = u => (u.fields && u.fields['System.State'] && u.fields['System.State'].newValue) || null;
   const azureStart = (updates.find(u => stateOf(u) === STATE.start) || {}).revisedDate || null;
-  const azureReview = (updates.find(u => stateOf(u) === STATE.review) || {}).revisedDate || null;
-  const g = inRepo ? branchGitDates(cwd, branch) : { reflogDate: null, firstCommit: null, lastCommit: null };
-  const sel = selectWindow({ azureStart, azureReview, ...g });
-  if (!sel.startDate) throw new Error(`Sem data de início (Azure nem git) para o card ${id}; informe --hours.`);
-  if (!sel.endDate) throw new Error(`Sem data de fim ("${STATE.review}" nem commit) para o card ${id}; informe --hours.`);
-  const windowHours = windowHoursBetween(sel.startDate, sel.endDate);
-  const factor = resolveHoursFactor();
-  return { hours: cardHoursFromWindow(windowHours, factor), windowHours, factor, ...sel };
-}
-
-function hoursNote(est) {
-  return `${est.hours}h estimadas (janela de ${fmtNum(est.windowHours)}h × ${fmtFactor(est.factor)}; início: ${est.startSource}, fim: ${est.endSource})`;
+  const g = inRepo ? branchGitDates(cwd, branch) : { reflogDates: [], firstCommit: null, lastCommit: null };
+  const commitDates = inRepo ? branchCommitDates(cwd, branch) : [];
+  return executionEstimate({ azureStart, reflogDates: g.reflogDates, commitDates, firstCommit: g.firstCommit, lastCommit: g.lastCommit });
 }
 
 // ---------- plano de cards + detecção de merge ----------
@@ -502,27 +502,29 @@ async function cmdLink(id, opt) {
 async function cmdTransition(cmd, id, opt, card) {
   if (cmd === 'review') req(opt.pr, '--pr <link do PR>');
   const provided = opt.hours !== undefined ? Number(String(opt.hours).replace(',', '.')) : null;
-  let hours = provided, hoursText = null;
+  let hours = provided;
   if (cmd === 'done') {
     const est = provided === null ? await estimateDoneHours(id, opt.branch || planBranchFor(id, opt)) : null;
-    const decided = resolveEstimatedHours(provided, est ? est.windowHours : 0, est ? est.factor : resolveHoursFactor());
-    hours = decided.hours;
-    hoursText = decided.estimated ? hoursNote(est) : `${decided.hours}h registradas`;
+    hours = decidedHours(provided, est ? est.hours : null);
   }
   if (hours !== null && (!Number.isFinite(hours) || hours < 0)) fail('--hours deve ser um número ≥ 0.');
-  return applyTransition(cmd, id, opt, card, hours, hoursText);
+  return applyTransition(cmd, id, opt, card, hours);
 }
 
-async function applyTransition(cmd, id, opt, card, hours, hoursText) {
+async function applyTransition(cmd, id, opt, card, hours) {
   const target = STATE[cmd];
   const resumo = opt.resumo ? mdToHtml(fs.readFileSync(path.resolve(opt.resumo), 'utf8')) : '';
-  const label = card?.code ? ` (card ${esc(card.code)})` : '';
-  const bits = [];
-  if (opt.branch) bits.push(`branch <code>${esc(String(opt.branch))}</code>`);
-  if (opt.pr) bits.push(`PR <a href="${esc(String(opt.pr))}">${esc(String(opt.pr))}</a>`);
-  if (hoursText) bits.push(hoursText);
-  const msg = { start: 'início da implementação', review: 'PR aberto, em code review', done: 'card concluído' }[cmd];
-  const history = `🤖 Agente: ${msg}${label}${bits.length ? ' — ' + bits.join(' · ') : ''}.${resumo ? '<br>' + resumo : ''}`;
+  let history;
+  if (cmd === 'done') {
+    history = `🤖 Agente: card concluído.${opt.pr ? ` PR <a href="${esc(String(opt.pr))}">${esc(String(opt.pr))}</a>` : ''}`;
+  } else {
+    const label = card?.code ? ` (card ${esc(card.code)})` : '';
+    const bits = [];
+    if (opt.branch) bits.push(`branch <code>${esc(String(opt.branch))}</code>`);
+    if (opt.pr) bits.push(`PR <a href="${esc(String(opt.pr))}">${esc(String(opt.pr))}</a>`);
+    const msg = { start: 'início da implementação', review: 'PR aberto, em code review', done: 'card concluído' }[cmd];
+    history = `🤖 Agente: ${msg}${label}${bits.length ? ' — ' + bits.join(' · ') : ''}.${resumo ? '<br>' + resumo : ''}`;
+  }
 
   let current = '?', tags = [], title = card?.title || '';
   if (!opt['dry-run']) {
@@ -600,23 +602,18 @@ async function cmdRehours(id, opt) {
   const row = readPlanRows(planPath(opt)).find(r => String(r.azure) === String(id));
   const branch = opt.branch || (row && row.branch) || null;
   const est = await estimateDoneHours(id, branch);
-  const it = await getItem(id, ['System.State', 'System.Title', 'System.Tags', 'Microsoft.VSTS.Scheduling.CompletedWork']);
+  const it = await getItem(id, ['System.State', 'System.Title', 'Microsoft.VSTS.Scheduling.CompletedWork']);
   const current = it.fields['Microsoft.VSTS.Scheduling.CompletedWork'];
-  const tags = splitTags(it.fields['System.Tags']);
   const title = it.fields['System.Title'];
-  const hist = `🤖 Agente: horas recalculadas — ${hoursNote(est)}.`;
   if (opt['dry-run']) {
     console.log(`[dry-run] ${id} | ${it.fields['System.State']} | ${title}`);
-    console.log(`[dry-run] horas: ${current ?? '-'} → ${est.hours} | início: ${est.startSource} (${est.startDate}) | fim: ${est.endSource} (${est.endDate}) | plano: ${row ? row.card : '-'}`);
-    console.log(`[dry-run] histórico: ${hist}`);
+    console.log(`[dry-run] início: ${est.startSource} ${est.startDate} | fim: ${est.endSource} ${est.endDate}`);
+    console.log(`[dry-run] atividade: útil ${Math.round(est.weekdayMinutes)} min × 1,5 + fim de semana ${Math.round(est.weekendMinutes)} min × 2,5 → ${est.hours}h | antes: ${current ?? '-'} | plano: ${row ? row.card : '-'}`);
     return;
   }
-  const ops = [
+  await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, [
     { op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.CompletedWork', value: est.hours },
-    { op: 'add', path: '/fields/System.History', value: hist },
-  ];
-  if (!tags.includes(TAG)) ops.push({ op: 'add', path: '/fields/System.Tags', value: [...tags, TAG].join('; ') });
-  await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
+  ], PATCH);
   console.log(`✅ ${id}: ${current ?? '-'} → ${est.hours}h`);
   upsertPlan(opt, { card: row?.card || title, azure: Number(id), title, branch, hours: est.hours });
 }
@@ -633,10 +630,9 @@ async function cmdSync(opt) {
       const det = detectMerged(cwd, row.branch, row.card);
       if (!det.merged) { console.log(`${row.card} | ${row.azure} | aberto | -`); continue; }
       const est = await estimateDoneHours(row.azure, det.ref || row.branch);
-      const hoursText = hoursNote(est);
       if (opt['dry-run']) { console.log(`${row.card} | ${row.azure} | mergeado (${det.reason}) | ${fmtHours(est.hours)} | marcaria Concluído`); continue; }
       const card = { code: row.card, name: row.title, title: row.title };
-      await applyTransition('done', Number(row.azure), { ...opt, branch: row.branch }, card, est.hours, hoursText);
+      await applyTransition('done', Number(row.azure), { ...opt, branch: row.branch }, card, est.hours);
       console.log(`${row.card} | ${row.azure} | mergeado (${det.reason}) | ${fmtHours(est.hours)} | Concluído`);
     } catch (e) {
       console.error(`${row.card} | ${row.azure} | erro: ${String(e.message).split('\n')[0]}`);
@@ -669,4 +665,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, windowHoursBetween, cardHoursFromWindow, resolveHoursFactor, resolveEstimatedHours, migratePlanLines, detectMerged, readPlanRows, selectWindow, branchGitDates, isGitRepo, hoursNote };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, activityMinutes, hoursFromMinutes, executionEstimate, decidedHours, resolveIdleGap, spNextMidnight, spDow, migratePlanLines, detectMerged, readPlanRows, branchGitDates, isGitRepo };
