@@ -228,19 +228,40 @@ function planBranchFor(id, opt) {
 }
 
 // A branch foi mergeada na mainRef? Por ancestralidade ou pelo assunto do commit (squash / branch apagada).
+// Branch sem trabalho próprio (nada desde a criação no reflog) é "aberta", mesmo sendo ancestral da main.
 function detectMerged(cwd, branch, code, mainRef = 'origin/main') {
   let ref = null;
   if (branch && gitOk(`rev-parse --verify --quiet origin/${branch}`, cwd)) ref = `origin/${branch}`;
   else if (branch && gitOk(`rev-parse --verify --quiet ${branch}`, cwd)) ref = branch;
-  if (ref && gitOk(`merge-base --is-ancestor ${ref} ${mainRef}`, cwd)) {
-    // Branch no mesmo ponto da main = recém-criada, sem commits próprios: não é merge.
-    if (git(`rev-parse ${ref}`, cwd) !== git(`rev-parse ${mainRef}`, cwd)) return { merged: true, reason: 'ancestor', ref };
-  }
+
   const subjects = git(`log ${mainRef} --format=%s -n 1000`, cwd).split('\n');
   const nb = branch ? branch.toLowerCase() : null;
   const nc = code ? `(${code.toLowerCase()})` : null;
-  const hit = subjects.find(s => { const t = s.toLowerCase(); return (nb && t.includes(nb)) || (nc && t.includes(nc)); });
-  if (hit) return { merged: true, reason: 'subject', ref, subject: hit };
+  const subjectHit = subjects.find(s => { const t = s.toLowerCase(); return (nb && t.includes(nb)) || (nc && t.includes(nc)); });
+
+  if (ref) {
+    let createdSha = null;
+    try {
+      const lines = git(`reflog show --format=%H ${branch}`, cwd).split('\n').filter(Boolean);
+      if (lines.length) createdSha = lines[lines.length - 1]; // entrada mais antiga = criação
+    } catch { /* sem reflog */ }
+
+    const refSha = git(`rev-parse ${ref}`, cwd);
+    const mainSha = git(`rev-parse ${mainRef}`, cwd);
+    const isAncestor = refSha !== mainSha && gitOk(`merge-base --is-ancestor ${ref} ${mainRef}`, cwd);
+
+    if (createdSha) {
+      // Sem commits próprios desde a criação → aberta, mesmo sendo ancestral da main.
+      const since = git(`rev-list --count ${createdSha}..${ref}`, cwd);
+      if (refSha === createdSha || since === '0') return { merged: false, ref, reason: 'no-own-commits' };
+      if (isAncestor) return { merged: true, reason: 'ancestor', ref };
+    } else if (isAncestor) {
+      // Sem reflog: a ancestralidade só vale com um commit na main citando o código do card.
+      if (nc && subjects.some(s => s.toLowerCase().includes(nc))) return { merged: true, reason: 'ancestor-code', ref };
+    }
+  }
+
+  if (subjectHit) return { merged: true, reason: 'subject', ref, subject: subjectHit };
   return { merged: false, ref };
 }
 function fmtHours(h) { return `${String(h).replace('.', ',')}h`; }
