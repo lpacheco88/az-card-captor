@@ -240,22 +240,24 @@ function detectMerged(cwd, branch, code, mainRef = 'origin/main') {
   const subjectHit = subjects.find(s => { const t = s.toLowerCase(); return (nb && t.includes(nb)) || (nc && t.includes(nc)); });
 
   if (ref) {
-    let createdSha = null;
+    // Reflog: sha da entrada mais antiga (criação) e se houve algum "commit:" próprio da branch.
+    let createdSha = null, hasOwnCommit = false;
     try {
-      const lines = git(`reflog show --format=%H ${branch}`, cwd).split('\n').filter(Boolean);
-      if (lines.length) createdSha = lines[lines.length - 1]; // entrada mais antiga = criação
+      const lines = git(`reflog show --format=%H%x09%gs ${branch}`, cwd).split('\n').filter(Boolean);
+      if (lines.length) {
+        createdSha = lines[lines.length - 1].split('\t')[0];
+        hasOwnCommit = lines.some(l => /^commit/.test((l.split('\t')[1] || '').trim()));
+      }
     } catch { /* sem reflog */ }
 
     const refSha = git(`rev-parse ${ref}`, cwd);
-    const mainSha = git(`rev-parse ${mainRef}`, cwd);
-    const isAncestor = refSha !== mainSha && gitOk(`merge-base --is-ancestor ${ref} ${mainRef}`, cwd);
 
     if (createdSha) {
-      // Sem commits próprios desde a criação → aberta, mesmo sendo ancestral da main.
-      const since = git(`rev-list --count ${createdSha}..${ref}`, cwd);
-      if (refSha === createdSha || since === '0') return { merged: false, ref, reason: 'no-own-commits' };
-      if (isAncestor) return { merged: true, reason: 'ancestor', ref };
-    } else if (isAncestor) {
+      // Sem trabalho próprio (mesma ponta da criação ou nenhum "commit:" no reflog) → aberta,
+      // mesmo sendo ancestral da main (cobre branch criada/resetada de um commit antigo da main).
+      if (refSha === createdSha || !hasOwnCommit) return { merged: false, ref, reason: 'no-own-commits' };
+      if (gitOk(`merge-base --is-ancestor ${ref} ${mainRef}`, cwd)) return { merged: true, reason: 'ancestor', ref };
+    } else if (gitOk(`merge-base --is-ancestor ${ref} ${mainRef}`, cwd)) {
       // Sem reflog: a ancestralidade só vale com um commit na main citando o código do card.
       if (nc && subjects.some(s => s.toLowerCase().includes(nc))) return { merged: true, reason: 'ancestor-code', ref };
     }
