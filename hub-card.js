@@ -107,9 +107,16 @@ function activityMinutes(points, idleGapHours) {
   return { weekdayMinutes, weekendMinutes };
 }
 
-// Horas = minutos úteis × 1,5 + minutos de fim de semana × 2,5; arredonda a 0,5 (mínimo 0,5).
+// Mínimo de 0,5h no TEMPO DE EXECUÇÃO (antes do multiplicador, proporcional a cada parte);
+// horas = útil × 1,5 + fim de semana × 2,5; resultado arredondado PARA CIMA em múltiplos de 0,5.
 function hoursFromMinutes({ weekdayMinutes, weekendMinutes }) {
-  return Math.max(0.5, Math.round((weekdayMinutes / 60 * 1.5 + weekendMinutes / 60 * 2.5) * 2) / 2);
+  const wdHours = weekdayMinutes / 60;
+  const weHours = weekendMinutes / 60;
+  const total = wdHours + weHours;
+  if (total === 0) return 0;
+  const bump = total < 0.5 ? 0.5 / total : 1;
+  const weighted = wdHours * bump * 1.5 + weHours * bump * 2.5;
+  return Math.ceil(weighted * 2) / 2;
 }
 
 function fmtNum(n) { return String(Math.round(Number(n) * 100) / 100).replace('.', ','); }
