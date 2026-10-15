@@ -10,6 +10,7 @@
 //   node hub-card.js done   (<id> | --card <md>) [--hours N] [--resumo <md>] [--pr <url>] -> Concluído
 //                                                            (sem --hours: estima por horas úteis Codificação → Code review)
 //   node hub-card.js sync [--dry-run]                        fecha (done) os cards do plano cuja branch já está mergeada na origin/main
+//   node hub-card.js rehours <id> [--dry-run]                recalcula as horas (regra nova) sem mudar o estado nem o CompletedWork de estado
 //   node hub-card.js reparent <id> (--parent <id> | --like <taskId>) move o card para outro pai (e área/iteração)
 //   node hub-card.js describe <id> --md <arquivo>            acrescenta/substitui a seção "🤖 Situação do backend"
 //                                                            no fim da Descrição (o texto do PM é preservado)
@@ -67,14 +68,15 @@ async function getItem(id, fields) {
 function splitTags(raw) { return String(raw || '').split(';').map(t => t.trim()).filter(Boolean); }
 function today() { return new Date().toISOString().slice(0, 10); }
 
-// ---------- horas úteis (seg–sex, 08:00–18:00 em America/Sao_Paulo / UTC-3) ----------
+// ---------- janela 08:00–18:00 em America/Sao_Paulo (UTC-3), TODOS os dias ----------
 const BH_TZ_OFFSET = -3;        // America/Sao_Paulo, sem horário de verão
 const BH_START_HOUR = 8;
 const BH_END_HOUR = 18;
+const DEFAULT_HOURS_FACTOR = 0.5;
 function spLocalMs(y, m, day, hour) { return Date.UTC(y, m, day, hour, 0, 0, 0) - BH_TZ_OFFSET * 3600 * 1000; }
 
-// Horas úteis entre dois instantes (Date ou ISO). Retorna 0 se fim <= início.
-function businessHoursBetween(startInput, endInput) {
+// Horas de janela (08:00–18:00, TODOS os dias, inclusive sábado e domingo) entre dois instantes.
+function windowHoursBetween(startInput, endInput) {
   const start = new Date(startInput).getTime();
   const end = new Date(endInput).getTime();
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
@@ -84,23 +86,36 @@ function businessHoursBetween(startInput, endInput) {
   const last = Date.UTC(e.getUTCFullYear(), e.getUTCMonth(), e.getUTCDate());
   let totalMs = 0;
   while (cursor.getTime() <= last) {
-    const dow = cursor.getUTCDay();
-    if (dow !== 0 && dow !== 6) {
-      const ws = spLocalMs(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate(), BH_START_HOUR);
-      const we = spLocalMs(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate(), BH_END_HOUR);
-      const os = Math.max(start, ws);
-      const oe = Math.min(end, we);
-      if (oe > os) totalMs += oe - os;
-    }
+    const ws = spLocalMs(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate(), BH_START_HOUR);
+    const we = spLocalMs(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate(), BH_END_HOUR);
+    const os = Math.max(start, ws);
+    const oe = Math.min(end, we);
+    if (oe > os) totalMs += oe - os;
     cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
   return totalMs / 3600000;
 }
 
-// Horas estimadas: horas úteis arredondadas para 0,5, com mínimo de 0,5.
-function estimatedHoursHalfUp(startInput, endInput) {
-  return Math.max(0.5, Math.round(businessHoursBetween(startInput, endInput) * 2) / 2);
+// Fator do card: padrão 0,5, trocável por HUB_CARD_HOURS_FACTOR (não vai no .env).
+function resolveHoursFactor() {
+  const raw = process.env.HUB_CARD_HOURS_FACTOR;
+  const f = raw === undefined || raw === '' ? DEFAULT_HOURS_FACTOR : Number(String(raw).replace(',', '.'));
+  return Number.isFinite(f) && f > 0 ? f : DEFAULT_HOURS_FACTOR;
 }
+
+// Horas do card = janela × fator, arredondado para 0,5, com mínimo de 0,5.
+function cardHoursFromWindow(windowHours, factor) {
+  return Math.max(0.5, Math.round(windowHours * factor * 2) / 2);
+}
+
+// --hours informado tem prioridade e NÃO recebe o fator.
+function resolveEstimatedHours(provided, windowHours, factor) {
+  if (provided !== null && provided !== undefined && provided !== '') return { hours: Number(provided), estimated: false };
+  return { hours: cardHoursFromWindow(windowHours, factor), estimated: true };
+}
+
+function fmtNum(n) { return String(Math.round(Number(n) * 100) / 100).replace('.', ','); }
+function fmtFactor(f) { return String(f).replace('.', ','); }
 
 // ---------- git (somente leitura, no repositório atual) ----------
 function git(args, cwd) {
@@ -130,7 +145,9 @@ async function estimateDoneHours(id, branch) {
     if (!branch) throw new Error(`Sem "${STATE.review}" no histórico e sem branch para ${id}; informe --hours.`);
     endDate = git(`log -1 --format=%cI ${branch}`, process.cwd());
   }
-  return { hours: estimatedHoursHalfUp(startDate, endDate), startDate, endDate, source: review ? 'review' : 'commit' };
+  const windowHours = windowHoursBetween(startDate, endDate);
+  const factor = resolveHoursFactor();
+  return { hours: cardHoursFromWindow(windowHours, factor), windowHours, factor, startDate, endDate, source: review ? 'review' : 'commit' };
 }
 
 // ---------- plano de cards + detecção de merge ----------
@@ -144,7 +161,7 @@ function readPlanRows(file) {
     if (!l.startsWith('|')) continue;
     const cols = l.split('|').slice(1, -1).map(c => c.trim());
     if (cols.length < 7 || cols[0] === 'Card' || /^:?-{3,}/.test(cols[1])) continue;
-    rows.push({ card: cols[0], azure: cols[1], title: cols[2], branch: cols[3], status: cols[4], pr: cols[5] });
+    rows.push({ card: cols[0], azure: cols[1], title: cols[2], branch: cols[3], status: cols[4], pr: cols[5], hours: cols.length >= 8 ? cols[6] : '' });
   }
   return rows;
 }
@@ -267,17 +284,33 @@ function splitCard(body) {
 }
 
 // ---------- plano de cards ----------
+// Normaliza as linhas para a tabela de 8 colunas (Card|Azure|Título|Branch|Status|PR|Horas|Atualizado):
+// o cabeçalho e as linhas antigas (7 colunas) ganham a célula vazia de "Horas".
+function migratePlanLines(lines) {
+  const isSep = c => /^:?-{3,}:?$/.test(c);
+  return lines.map(l => {
+    if (!l.startsWith('|')) return l;
+    let cols = l.split('|').slice(1, -1).map(c => c.trim());
+    if (cols[0] === 'Card') cols = ['Card', 'Azure', 'Título', 'Branch', 'Status', 'PR', 'Horas', 'Atualizado'];
+    else if (isSep(cols[1] || '')) cols = ['---', '---', '---', '---', '---', '---', '---', '---'];
+    else if (cols.length === 7) cols = [...cols.slice(0, 6), '', cols[6]];
+    else if (cols.length === 6) cols = [...cols.slice(0, 6), ''];
+    return `| ${cols.join(' | ')} |`;
+  });
+}
+
 function upsertPlan(opt, row) {
   const file = opt.plan ? path.resolve(opt.plan) : path.resolve(process.cwd(), 'Claude outputs', 'plano-cards.md');
   if (!fs.existsSync(path.dirname(file))) { warn(`Plano não atualizado: a pasta ${path.dirname(file)} não existe (use --plan).`); return; }
-  const head = ['| Card | Azure | Título | Branch | Status | PR | Atualizado |', '| --- | --- | --- | --- | --- | --- | --- |'];
+  const head = ['| Card | Azure | Título | Branch | Status | PR | Horas | Atualizado |', '| --- | --- | --- | --- | --- | --- | --- | --- |'];
   let lines = fs.existsSync(file)
     ? fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n').split('\n')
     : ['# Plano de cards — backend × Azure DevOps', '', 'Atualizado pelo `hub-card.js` (azure-worker). Uma linha por card; a coluna Azure é a chave.', '', ...head];
   if (!lines.some(l => l.startsWith('| Card | Azure'))) lines.push('', ...head);
+  lines = migratePlanLines(lines);
   const cols = l => l.split('|').slice(1, -1).map(c => c.trim());
   const idx = lines.findIndex(l => l.startsWith('|') && cols(l)[1] === String(row.azure));
-  const keys = ['card', 'azure', 'title', 'branch', 'status', 'pr'];
+  const keys = ['card', 'azure', 'title', 'branch', 'status', 'pr', 'hours'];
   const cur = {};
   if (idx >= 0) cols(lines[idx]).forEach((v, i) => { if (keys[i]) cur[keys[i]] = v; });
   const merged = { ...cur };
@@ -418,26 +451,28 @@ async function cmdLink(id, opt) {
 
 async function cmdTransition(cmd, id, opt, card) {
   if (cmd === 'review') req(opt.pr, '--pr <link do PR>');
-  let hours = opt.hours !== undefined ? Number(String(opt.hours).replace(',', '.')) : null;
-  let estimated = false;
-  if (cmd === 'done' && hours === null) {
-    const branch = opt.branch || planBranchFor(id, opt);
-    const est = await estimateDoneHours(id, branch);
-    hours = est.hours;
-    estimated = true;
+  const provided = opt.hours !== undefined ? Number(String(opt.hours).replace(',', '.')) : null;
+  let hours = provided, hoursText = null;
+  if (cmd === 'done') {
+    const est = provided === null ? await estimateDoneHours(id, opt.branch || planBranchFor(id, opt)) : null;
+    const decided = resolveEstimatedHours(provided, est ? est.windowHours : 0, est ? est.factor : resolveHoursFactor());
+    hours = decided.hours;
+    hoursText = decided.estimated
+      ? `${decided.hours}h estimadas (janela de ${fmtNum(est.windowHours)}h × ${fmtFactor(est.factor)}, 08–18 todos os dias)`
+      : `${decided.hours}h registradas`;
   }
   if (hours !== null && (!Number.isFinite(hours) || hours < 0)) fail('--hours deve ser um número ≥ 0.');
-  return applyTransition(cmd, id, opt, card, hours, estimated);
+  return applyTransition(cmd, id, opt, card, hours, hoursText);
 }
 
-async function applyTransition(cmd, id, opt, card, hours, estimated) {
+async function applyTransition(cmd, id, opt, card, hours, hoursText) {
   const target = STATE[cmd];
   const resumo = opt.resumo ? mdToHtml(fs.readFileSync(path.resolve(opt.resumo), 'utf8')) : '';
   const label = card?.code ? ` (card ${esc(card.code)})` : '';
   const bits = [];
   if (opt.branch) bits.push(`branch <code>${esc(String(opt.branch))}</code>`);
   if (opt.pr) bits.push(`PR <a href="${esc(String(opt.pr))}">${esc(String(opt.pr))}</a>`);
-  if (hours !== null) bits.push(estimated ? `${hours}h estimadas (Codificação → Code review, horas úteis)` : `${hours}h registradas`);
+  if (hoursText) bits.push(hoursText);
   const msg = { start: 'início da implementação', review: 'PR aberto, em code review', done: 'card concluído' }[cmd];
   const history = `🤖 Agente: ${msg}${label}${bits.length ? ' — ' + bits.join(' · ') : ''}.${resumo ? '<br>' + resumo : ''}`;
 
@@ -513,6 +548,31 @@ async function cmdDescribe(id, opt) {
   console.log(`✅ ${id} | ${it.fields['System.State']} | ${it.fields['System.Title']}: seção ${replaced ? 'atualizada' : 'adicionada'}`);
 }
 
+async function cmdRehours(id, opt) {
+  const row = readPlanRows(planPath(opt)).find(r => String(r.azure) === String(id));
+  const branch = opt.branch || (row && row.branch) || null;
+  const est = await estimateDoneHours(id, branch);
+  const it = await getItem(id, ['System.State', 'System.Title', 'System.Tags', 'Microsoft.VSTS.Scheduling.CompletedWork']);
+  const current = it.fields['Microsoft.VSTS.Scheduling.CompletedWork'];
+  const tags = splitTags(it.fields['System.Tags']);
+  const title = it.fields['System.Title'];
+  const hist = `🤖 Agente: horas recalculadas — ${est.hours}h estimadas (janela de ${fmtNum(est.windowHours)}h × ${fmtFactor(est.factor)}, 08–18 todos os dias).`;
+  if (opt['dry-run']) {
+    console.log(`[dry-run] ${id} | ${it.fields['System.State']} | ${title}`);
+    console.log(`[dry-run] horas: ${current ?? '-'} → ${est.hours} (janela ${fmtNum(est.windowHours)}h × ${fmtFactor(est.factor)}) | plano: ${row ? row.card : '-'} | fim: ${est.source}`);
+    console.log(`[dry-run] histórico: ${hist}`);
+    return;
+  }
+  const ops = [
+    { op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.CompletedWork', value: est.hours },
+    { op: 'add', path: '/fields/System.History', value: hist },
+  ];
+  if (!tags.includes(TAG)) ops.push({ op: 'add', path: '/fields/System.Tags', value: [...tags, TAG].join('; ') });
+  await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
+  console.log(`✅ ${id}: ${current ?? '-'} → ${est.hours}h`);
+  upsertPlan(opt, { card: row?.card || title, azure: Number(id), title, branch, hours: est.hours });
+}
+
 async function cmdSync(opt) {
   const cwd = process.cwd();
   const file = planPath(opt);
@@ -524,11 +584,12 @@ async function cmdSync(opt) {
     try {
       const det = detectMerged(cwd, row.branch, row.card);
       if (!det.merged) { console.log(`${row.card} | ${row.azure} | aberto | -`); continue; }
-      const { hours } = await estimateDoneHours(row.azure, det.ref || row.branch);
-      if (opt['dry-run']) { console.log(`${row.card} | ${row.azure} | mergeado (${det.reason}) | ${fmtHours(hours)} | marcaria Concluído`); continue; }
+      const est = await estimateDoneHours(row.azure, det.ref || row.branch);
+      const hoursText = `${est.hours}h estimadas (janela de ${fmtNum(est.windowHours)}h × ${fmtFactor(est.factor)}, 08–18 todos os dias)`;
+      if (opt['dry-run']) { console.log(`${row.card} | ${row.azure} | mergeado (${det.reason}) | ${fmtHours(est.hours)} | marcaria Concluído`); continue; }
       const card = { code: row.card, name: row.title, title: row.title };
-      await applyTransition('done', Number(row.azure), { ...opt, branch: row.branch }, card, hours, true);
-      console.log(`${row.card} | ${row.azure} | mergeado (${det.reason}) | ${fmtHours(hours)} | Concluído`);
+      await applyTransition('done', Number(row.azure), { ...opt, branch: row.branch }, card, est.hours, hoursText);
+      console.log(`${row.card} | ${row.azure} | mergeado (${det.reason}) | ${fmtHours(est.hours)} | Concluído`);
     } catch (e) {
       console.error(`${row.card} | ${row.azure} | erro: ${String(e.message).split('\n')[0]}`);
     }
@@ -552,6 +613,7 @@ async function main() {
     case 'reparent': return cmdReparent(Number(req(pos[0], '<id>')), opt);
     case 'describe': return cmdDescribe(Number(req(pos[0], '<id>')), opt);
     case 'sync': return cmdSync(opt);
+    case 'rehours': return cmdRehours(Number(req(pos[0], '<id>')), opt);
     case 'start': case 'review': case 'done': { const { id, card } = idOrCard(); return cmdTransition(cmd, id, opt, card); }
     default:
       console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 17).map(l => l.replace(/^\/\/ ?/, '')).join('\n'));
@@ -559,4 +621,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, businessHoursBetween, estimatedHoursHalfUp, detectMerged, readPlanRows };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, windowHoursBetween, cardHoursFromWindow, resolveHoursFactor, resolveEstimatedHours, migratePlanLines, detectMerged, readPlanRows };
