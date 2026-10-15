@@ -107,16 +107,19 @@ function activityMinutes(points, idleGapHours) {
   return { weekdayMinutes, weekendMinutes };
 }
 
-// Mínimo de 0,5h no TEMPO DE EXECUÇÃO (antes do multiplicador, proporcional a cada parte);
-// horas = útil × 1,5 + fim de semana × 2,5; resultado arredondado PARA CIMA em múltiplos de 0,5.
-function hoursFromMinutes({ weekdayMinutes, weekendMinutes }) {
-  const wdHours = weekdayMinutes / 60;
-  const weHours = weekendMinutes / 60;
+// Mínimo de 0,5h no TEMPO DE EXECUÇÃO (antes do multiplicador, proporcional a cada parte).
+// Sem intervalos (por-assunto / sem reflog/commits), o mínimo é classificado pelo dia do início.
+// horas = útil × 1,5 + fim de semana × 2,5; arredonda PARA CIMA em múltiplos de 0,5. Nunca 0.
+function hoursFromMinutes({ weekdayMinutes, weekendMinutes }, assumedDow = 1) {
+  let wdHours = weekdayMinutes / 60;
+  let weHours = weekendMinutes / 60;
   const total = wdHours + weHours;
-  if (total === 0) return 0;
-  const bump = total < 0.5 ? 0.5 / total : 1;
-  const weighted = wdHours * bump * 1.5 + weHours * bump * 2.5;
-  return Math.ceil(weighted * 2) / 2;
+  if (total < 0.5) {
+    if (total > 0) { const k = 0.5 / total; wdHours *= k; weHours *= k; }
+    else if (assumedDow === 0 || assumedDow === 6) weHours = 0.5;
+    else wdHours = 0.5;
+  }
+  return Math.max(0.5, Math.ceil((wdHours * 1.5 + weHours * 2.5) * 2) / 2);
 }
 
 function fmtNum(n) { return String(Math.round(Number(n) * 100) / 100).replace('.', ','); }
@@ -183,11 +186,11 @@ function executionEstimate({ azureStart, reflogDates = [], commitDates = [], fir
   if (!cands.length) throw new Error('Sem data de início (reflog, Codificação ou commit).');
   cands.sort((a, b) => a[0] - b[0]);
   const [start, startSource] = cands[0];
-  if (!valid(lastCommit)) throw new Error('Sem último commit da branch.');
-  const end = ms(lastCommit);
+  // Sem commits disponíveis (por-assunto / branch apagada): fim = início → só o mínimo.
+  const end = valid(lastCommit) ? ms(lastCommit) : start;
   const points = [...new Set([start, ...[...reflogDates, ...commitDates].map(ms), end].filter(t => t >= start && t <= end))].sort((a, b) => a - b);
   const { weekdayMinutes, weekendMinutes } = activityMinutes(points, idleGapHours);
-  return { startDate: new Date(start).toISOString(), endDate: new Date(end).toISOString(), startSource, endSource: 'commit', weekdayMinutes, weekendMinutes, hours: hoursFromMinutes({ weekdayMinutes, weekendMinutes }) };
+  return { startDate: new Date(start).toISOString(), endDate: new Date(end).toISOString(), startSource, endSource: 'commit', weekdayMinutes, weekendMinutes, hours: hoursFromMinutes({ weekdayMinutes, weekendMinutes }, spDow(start)) };
 }
 
 // --hours informado tem prioridade e não recebe multiplicador.
