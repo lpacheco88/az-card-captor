@@ -11,6 +11,7 @@
 //                                                            (sem --hours: tempo de execução × 1,5 útil / × 2,5 fim de semana)
 //   node hub-card.js sync [--dry-run]                        fecha (done) os cards do plano cuja branch já está mergeada na origin/main
 //   node hub-card.js rehours <id> [--dry-run]                recalcula o CompletedWork e a coluna Horas do plano, sem mudar o estado
+//   node hub-card.js retarget <id> [--dry-run]               move o card para a sprint ATUAL do time (sem mudar estado nem pai)
 //   node hub-card.js reparent <id> (--parent <id> | --like <taskId>) move o card para outro pai (e área/iteração)
 //   node hub-card.js describe <id> --md <arquivo>            acrescenta/substitui a seção "🤖 Situação do backend"
 //                                                            no fim da Descrição (o texto do PM é preservado)
@@ -26,6 +27,7 @@ const axios = require('axios');
 const { execSync } = require('child_process');
 
 const { AZURE_DEVOPS_ORG: ORG, AZURE_DEVOPS_PROJECT: PROJECT, AZURE_DEVOPS_PAT: PAT, TARGET_EPIC_ID: EPIC } = process.env;
+const DEFAULT_TEAM = 'Industria';                        // time padrão do board (HUB_CARD_TEAM sobrescreve)
 const API = '7.0';
 const BASE = `https://dev.azure.com/${ORG}/${encodeURIComponent(PROJECT || '')}/_apis`;
 const TYPE = 'Task Code';
@@ -420,12 +422,34 @@ async function ancestry(id) {
   return chain;
 }
 function fmtChain(chain) { return chain.map(c => `${c.id} (${c.type})`).join(' → '); }
-// Resolve o pai e a área/iteração: com --like, copia do Task Code irmão (é o que garante o mesmo board);
-// sem --like, herda do pai. Exige que o pai esteja sob o épico TARGET_EPIC_ID (salvo --any-epic).
+
+// Sprint atual do time (HUB_CARD_TEAM; padrão DEFAULT_TEAM). `--iteration` sobrescreve no chamador.
+let _currentIteration;
+async function currentIteration() {
+  if (_currentIteration) return _currentIteration;
+  const team = process.env.HUB_CARD_TEAM || DEFAULT_TEAM;
+  const url = `https://dev.azure.com/${ORG}/${encodeURIComponent(PROJECT || '')}/${encodeURIComponent(team)}/_apis/work/teamsettings/iterations?$timeframe=current&api-version=${API}`;
+  const r = await ax().get(url);
+  const it = (r.data.value || [])[0];
+  if (!it) fail(`Sem sprint atual para o time "${team}".`);
+  return (_currentIteration = it.path);
+}
+function normalizeAssignedTo(v) {
+  if (!v) return null;
+  if (typeof v === 'string') return v;
+  return v.uniqueName || v.displayName || null;
+}
+// Responsável: --assign, HUB_CARD_ASSIGNEE, senão o AssignedTo do irmão (--like).
+function pickAssignee({ assign, likeAssignedTo } = {}) {
+  return assign || process.env.HUB_CARD_ASSIGNEE || normalizeAssignedTo(likeAssignedTo) || null;
+}
+
+// Resolve o pai, a área e a iteração. A área vem do irmão (--like) ou do pai; a iteração é a
+// sprint ATUAL do time (nunca a do irmão), salvo --iteration. Exige pai sob o épico (salvo --any-epic).
 async function resolvePlacement(opt) {
   let like = null, parent = opt.parent ? Number(opt.parent) : null;
   if (opt.like) {
-    const l = await getItem(opt.like, ['System.WorkItemType', 'System.Parent', 'System.AreaPath', 'System.IterationPath']);
+    const l = await getItem(opt.like, ['System.WorkItemType', 'System.Parent', 'System.AreaPath', 'System.AssignedTo']);
     like = l.fields;
     if (!parent) parent = like['System.Parent'];
     if (!parent) fail(`O card ${opt.like} não tem pai.`);
@@ -438,8 +462,9 @@ async function resolvePlacement(opt) {
     fail(`O pai ${parent} não está no épico ${epic}: ${fmtChain(chain)}. Use --like <Task Code do board certo> ou --parent de uma feature do épico.`);
   }
   const area = opt.area || (like ? like['System.AreaPath'] : chain[0].area);
-  const iteration = opt.iteration || (like ? like['System.IterationPath'] : chain[0].iteration);
-  return { parent, chain, area, iteration };
+  const iteration = opt.iteration || await currentIteration();
+  const assignedTo = pickAssignee({ assign: opt.assign, likeAssignedTo: like ? like['System.AssignedTo'] : null });
+  return { parent, chain, area, iteration, assignedTo };
 }
 
 // ---------- comandos ----------
@@ -492,9 +517,9 @@ async function cmdCreate(opt) {
     console.log(`[dry-run] criaria ${TYPE}: "${title}" (sem PAT: pai e épico não verificados)`);
     return;
   }
-  const { parent, chain, area, iteration } = await resolvePlacement(opt);
+  const { parent, chain, area, iteration, assignedTo } = await resolvePlacement(opt);
   console.log(`Pai: ${fmtChain(chain)}`);
-  console.log(`Área: ${area} | Iteração: ${iteration}`);
+  console.log(`Área: ${area} | Iteração: ${iteration}${assignedTo ? ` | Responsável: ${assignedTo}` : ''}`);
   if (opt['dry-run']) {
     console.log(`[dry-run] criaria ${TYPE}: "${title}" | descrição ${description.length} chars | critérios ${acceptance.length} chars`);
     console.log(`[dry-run] gravaria azure: <id> em ${path.basename(card.full)} e a linha no plano`);
@@ -510,7 +535,7 @@ async function cmdCreate(opt) {
     { op: 'add', path: '/relations/-', value: { rel: 'System.LinkTypes.Hierarchy-Reverse', url: `https://dev.azure.com/${ORG}/_apis/wit/workItems/${parent}` } },
   ];
   if (acceptance) ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Common.AcceptanceCriteria', value: acceptance });
-  if (opt.assign) ops.push({ op: 'add', path: '/fields/System.AssignedTo', value: opt.assign });
+  if (assignedTo) ops.push({ op: 'add', path: '/fields/System.AssignedTo', value: assignedTo });
   const r = await ax().post(`${BASE}/wit/workitems/$${encodeURIComponent(TYPE)}?api-version=${API}`, ops, PATCH);
   const id = r.data.id;
   console.log(`✅ Criado ${TYPE} ${id}: ${title}`);
@@ -607,6 +632,23 @@ async function cmdReparent(id, opt) {
   console.log(`✅ ${id} movido.`);
 }
 
+// Move um card já criado para a sprint atual do time (sem mudar estado nem pai).
+async function cmdRetarget(id, opt) {
+  const it = await getItem(id, ['System.WorkItemType', 'System.Title', 'System.State', 'System.IterationPath']);
+  if (it.fields['System.WorkItemType'] !== TYPE) fail(`${id} é ${it.fields['System.WorkItemType']}, não ${TYPE}.`);
+  const to = opt.iteration || await currentIteration();
+  const from = it.fields['System.IterationPath'];
+  console.log(`${id} | ${it.fields['System.State']} | ${it.fields['System.Title']}`);
+  console.log(`  iteração: ${from ?? '-'} → ${to}`);
+  if (opt['dry-run']) { console.log('[dry-run] nada gravado'); return; }
+  if (from === to) { console.log(`✅ ${id} já está na sprint ${to}; nada a fazer.`); return; }
+  await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, [
+    { op: 'add', path: '/fields/System.IterationPath', value: to },
+    { op: 'add', path: '/fields/System.History', value: `🤖 Agente: card movido para a sprint ${to} (antes: ${from ?? '-'}).` },
+  ], PATCH);
+  console.log(`✅ ${id}: iteração → ${to}`);
+}
+
 const SITUACAO = '🤖 Situação do backend';
 async function cmdDescribe(id, opt) {
   const file = path.resolve(req(opt.md, '--md <arquivo>'));
@@ -695,6 +737,7 @@ async function main() {
     case 'describe': return cmdDescribe(Number(req(pos[0], '<id>')), opt);
     case 'sync': return cmdSync(opt);
     case 'rehours': return cmdRehours(Number(req(pos[0], '<id>')), opt);
+    case 'retarget': return cmdRetarget(Number(req(pos[0], '<id>')), opt);
     case 'start': case 'review': case 'done': { const { id, card } = idOrCard(); return cmdTransition(cmd, id, opt, card); }
     default:
       console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 17).map(l => l.replace(/^\/\/ ?/, '')).join('\n'));
@@ -702,4 +745,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, activityMinutes, hoursFromMinutes, executionEstimate, decidedHours, resolveIdleGap, spNextMidnight, spDow, migratePlanLines, detectMerged, readPlanRows, branchGitDates, isGitRepo };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, activityMinutes, hoursFromMinutes, executionEstimate, decidedHours, resolveIdleGap, spNextMidnight, spDow, migratePlanLines, detectMerged, readPlanRows, branchGitDates, isGitRepo, pickAssignee, normalizeAssignedTo };
