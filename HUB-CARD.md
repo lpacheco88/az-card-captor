@@ -13,8 +13,8 @@ nunca aparece na saída.
 | PR mergeado | `... done --card ... [--hours <N>] [--resumo <md>]` | Concluído |
 | Fechar os cards já mergeados | `... sync [--dry-run]` | Concluído nos mergeados |
 | Ajustar horas (estimativa) | `... rehours <id> [--hours N] [--dry-run]` | Sem mudar o estado |
-| Card no board errado | `... reparent <id> --like <task code do board certo>` | Move o pai e a área/iteração |
-| Mover um card para a sprint atual | `... retarget <id> [--dry-run]` | Sprint atual do time (sem mudar estado/pai) |
+| Card no board errado | `... reparent <id> (--like <task code> | --parent <id>) --confirm` | Move o pai e a área/iteração |
+| Mover um card para a sprint atual | `... retarget <id> --confirm [--dry-run]` | Sprint atual do time (sem mudar estado/pai) |
 | `describe <id> --md <arquivo>` | Acrescenta ou substitui a seção "🤖 Situação do backend" no fim da Descrição, sem apagar o texto do PM | — |
 
 - `create`/`link` gravam `azure: <id>` no cabeçalho do card e a linha em `Claude outputs/plano-cards.md` (colunas: Card, Azure, Título, Branch, Status, PR, **Horas**, Atualizado; o `done`/`rehours` grava as horas na coluna Horas).
@@ -26,6 +26,7 @@ nunca aparece na saída.
 - A **iteração** (sprint) do `create`/`reparent`/`retarget` é sempre a **sprint atual do time** (`GET .../teamsettings/iterations?$timeframe=current`), time em **`HUB_CARD_TEAM`** (padrão no código: `Industria`) — **nunca** a do irmão. `--iteration <path>` sobrescreve.
 - **Responsável** no `create`: **`--assign`** → senão **`HUB_CARD_ASSIGNEE`** (variável de ambiente, fora do `.env`) → senão o `AssignedTo` do irmão do `--like`.
 - `retarget <id> [--dry-run]` move um card **já criado** para a sprint atual do time, **sem** mudar estado nem pai (só `System.IterationPath` + histórico).
+- **Mudar a sprint de um card existente só com `--confirm` e por ordem do Luciano.** `retarget` e `reparent` sem `--confirm` apenas mostram o que fariam e saem com aviso. **Nenhum outro comando** (`rehours`, `done`, `sync`, `link`, `start`, `review`, `describe`) grava `System.IterationPath`; só o `create` define a sprint do card **novo** (sprint atual do time).
 ## Horas do card = estimativa de dev sênior (front matter `estimativa:`)
 
 Sem cálculo pelo git. O valor vem do campo **`estimativa:`** no cabeçalho do card `.md`.

@@ -113,6 +113,14 @@ function gitOk(args, cwd) {
   try { git(args, cwd); return true; } catch { return false; }
 }
 
+// Só create/retarget/reparent podem mexer em System.IterationPath. Os demais comandos são barrados.
+function guardNoIteration(cmd, ops) {
+  if (cmd === 'create' || cmd === 'retarget' || cmd === 'reparent') return;
+  if (ops.some(op => op && typeof op.path === 'string' && op.path.includes('System.IterationPath'))) {
+    throw new Error(`Comando "${cmd}" não pode alterar System.IterationPath.`);
+  }
+}
+
 // ---------- plano de cards + detecção de merge ----------
 function planPath(opt) {
   return opt.plan ? path.resolve(opt.plan) : path.resolve(process.cwd(), 'Claude outputs', 'plano-cards.md');
@@ -457,9 +465,9 @@ async function cmdLink(id, opt) {
   if (opt['dry-run']) return;
   writeCardAzure(card, id);
   if (estimativa !== null) {
-    await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, [
-      { op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.OriginalEstimate', value: estimativa },
-    ], PATCH);
+    const lops = [{ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.OriginalEstimate', value: estimativa }];
+    guardNoIteration('link', lops);
+    await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, lops, PATCH);
     console.log(`✅ ${id}: OriginalEstimate = ${estimativa}`);
   }
   upsertPlan(opt, { card: card.code || card.name, azure: id, title, status: state });
@@ -509,6 +517,7 @@ async function applyTransition(cmd, id, opt, card, hours) {
     if (cmd === 'done') ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.RemainingWork', value: 0 });
   }
   ops.push({ op: 'add', path: '/fields/System.History', value: history });
+  guardNoIteration(cmd, ops);
 
   if (opt['dry-run']) {
     console.log(`[dry-run] ${id}: estado → ${target}${hours !== null ? ` | horas ${hours}` : ''}`);
@@ -535,6 +544,7 @@ async function cmdReparent(id, opt) {
   console.log(`  área: ${f['System.AreaPath']} → ${area}`);
   console.log(`  iteração: ${f['System.IterationPath']} → ${iteration}`);
   if (opt['dry-run']) { console.log('[dry-run] nada gravado'); return; }
+  if (!opt.confirm) { console.warn('⚠️  sem --confirm: nada gravado. O reparent altera a sprint; só com --confirm e por ordem do Luciano.'); return; }
   const ops = [];
   if (idx >= 0 && oldParent !== parent) ops.push({ op: 'remove', path: `/relations/${idx}` });
   if (oldParent !== parent) ops.push({ op: 'add', path: '/relations/-', value: { rel: 'System.LinkTypes.Hierarchy-Reverse', url: `https://dev.azure.com/${ORG}/_apis/wit/workItems/${parent}` } });
@@ -554,6 +564,7 @@ async function cmdRetarget(id, opt) {
   console.log(`${id} | ${it.fields['System.State']} | ${it.fields['System.Title']}`);
   console.log(`  iteração: ${from ?? '-'} → ${to}`);
   if (opt['dry-run']) { console.log('[dry-run] nada gravado'); return; }
+  if (!opt.confirm) { console.warn('⚠️  sem --confirm: nada gravado. Mover a sprint só com --confirm e por ordem do Luciano.'); return; }
   if (from === to) { console.log(`✅ ${id} já está na sprint ${to}; nada a fazer.`); return; }
   await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, [
     { op: 'add', path: '/fields/System.IterationPath', value: to },
@@ -584,6 +595,7 @@ async function cmdDescribe(id, opt) {
     { op: 'add', path: '/fields/System.History', value: `🤖 Agente: seção "${SITUACAO}" ${replaced ? 'atualizada' : 'adicionada'} na descrição.` },
   ];
   if (!tags.includes(TAG)) ops.push({ op: 'add', path: '/fields/System.Tags', value: [...tags, TAG].join('; ') });
+  guardNoIteration('describe', ops);
   await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
   console.log(`✅ ${id} | ${it.fields['System.State']} | ${it.fields['System.Title']}: seção ${replaced ? 'atualizada' : 'adicionada'}`);
 }
@@ -617,6 +629,7 @@ async function cmdRehours(id, opt) {
         { op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.CompletedWork', value },
         { op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.RemainingWork', value: 0 },
       ];
+  guardNoIteration('rehours', ops);
   await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
   console.log(`✅ ${id}: OriginalEstimate ${oe ?? '-'} → ${value}${originalOnly ? '' : ` | CompletedWork ${cw ?? '-'} → ${value} | RemainingWork → 0`}`);
   if (!originalOnly) upsertPlan(opt, { card: row?.card || title, azure: Number(id), title, hours: value });
@@ -674,4 +687,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, pickAssignee, normalizeAssignedTo };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, pickAssignee, normalizeAssignedTo, guardNoIteration };
