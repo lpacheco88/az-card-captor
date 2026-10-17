@@ -339,22 +339,41 @@ async function currentIteration() {
   if (!it) fail(`Sem sprint atual para o time "${team}".`);
   return (_currentIteration = it.path);
 }
-function normalizeAssignedTo(v) {
+// Usuário autenticado do PAT (identidade usada para atribuir). Cacheado.
+let _patUser;
+async function patUser() {
+  if (_patUser) return _patUser;
+  const r = await ax().get(`https://dev.azure.com/${ORG}/_apis/connectionData?api-version=7.0-preview`);
+  const u = r.data.authenticatedUser || {};
+  const uniqueName = u.providerDisplayName || (u.properties && u.properties.Account && u.properties.Account.$value) || null;
+  _patUser = { id: u.id, uniqueName, displayName: u.customDisplayName || u.providerDisplayName || uniqueName };
+  return _patUser;
+}
+function identityOf(v) {
   if (!v) return null;
-  if (typeof v === 'string') return v;
-  return v.uniqueName || v.displayName || null;
+  if (typeof v === 'string') return v.toLowerCase();
+  return String(v.uniqueName || v.displayName || '').toLowerCase() || null;
 }
-// Responsável: --assign, HUB_CARD_ASSIGNEE, senão o AssignedTo do irmão (--like).
-function pickAssignee({ assign, likeAssignedTo } = {}) {
-  return assign || process.env.HUB_CARD_ASSIGNEE || normalizeAssignedTo(likeAssignedTo) || null;
+function sameIdentity(a, b) { const x = identityOf(a), y = identityOf(b); return !!x && !!y && x === y; }
+// --assign > HUB_CARD_ASSIGNEE > usuário do PAT. Se o card já for o alvo, retorna null (sem op).
+function decideAssignee({ assign, envAssignee, patUser: pat, current } = {}) {
+  const target = assign || envAssignee || pat;
+  if (!target) return null;
+  return sameIdentity(current, target) ? null : target;
 }
+async function assignedToOp(opt, current) {
+  const pat = (await patUser()).uniqueName;
+  const value = decideAssignee({ assign: opt.assign, envAssignee: process.env.HUB_CARD_ASSIGNEE, patUser: pat, current });
+  return value ? { op: 'add', path: '/fields/System.AssignedTo', value } : null;
+}
+function who(v) { return !v ? '-' : (typeof v === 'string' ? v : (v.uniqueName || v.displayName || '-')); }
 
 // Resolve o pai, a área e a iteração. A área vem do irmão (--like) ou do pai; a iteração é a
 // sprint ATUAL do time (nunca a do irmão), salvo --iteration. Exige pai sob o épico (salvo --any-epic).
 async function resolvePlacement(opt) {
   let like = null, parent = opt.parent ? Number(opt.parent) : null;
   if (opt.like) {
-    const l = await getItem(opt.like, ['System.WorkItemType', 'System.Parent', 'System.AreaPath', 'System.AssignedTo']);
+    const l = await getItem(opt.like, ['System.WorkItemType', 'System.Parent', 'System.AreaPath']);
     like = l.fields;
     if (!parent) parent = like['System.Parent'];
     if (!parent) fail(`O card ${opt.like} não tem pai.`);
@@ -368,8 +387,7 @@ async function resolvePlacement(opt) {
   }
   const area = opt.area || (like ? like['System.AreaPath'] : chain[0].area);
   const iteration = opt.iteration || await currentIteration();
-  const assignedTo = pickAssignee({ assign: opt.assign, likeAssignedTo: like ? like['System.AssignedTo'] : null });
-  return { parent, chain, area, iteration, assignedTo };
+  return { parent, chain, area, iteration };
 }
 
 // ---------- comandos ----------
@@ -424,9 +442,11 @@ async function cmdCreate(opt) {
     console.log(`[dry-run] criaria ${TYPE}: "${title}" (sem PAT: pai e épico não verificados)`);
     return;
   }
-  const { parent, chain, area, iteration, assignedTo } = await resolvePlacement(opt);
+  const { parent, chain, area, iteration } = await resolvePlacement(opt);
+  const assignOp = await assignedToOp(opt, null);
+  const assignTarget = assignOp ? assignOp.value : (await patUser()).uniqueName;
   console.log(`Pai: ${fmtChain(chain)}`);
-  console.log(`Área: ${area} | Iteração: ${iteration}${assignedTo ? ` | Responsável: ${assignedTo}` : ''}`);
+  console.log(`Área: ${area} | Iteração: ${iteration} | Responsável: ${assignTarget}`);
   if (opt['dry-run']) {
     console.log(`[dry-run] criaria ${TYPE}: "${title}" | estimativa ${estimativa}h | descrição ${description.length} chars | critérios ${acceptance.length} chars`);
     console.log(`[dry-run] gravaria azure: <id> em ${path.basename(card.full)} e a linha no plano`);
@@ -443,7 +463,7 @@ async function cmdCreate(opt) {
     { op: 'add', path: '/relations/-', value: { rel: 'System.LinkTypes.Hierarchy-Reverse', url: `https://dev.azure.com/${ORG}/_apis/wit/workItems/${parent}` } },
   ];
   if (acceptance) ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Common.AcceptanceCriteria', value: acceptance });
-  if (assignedTo) ops.push({ op: 'add', path: '/fields/System.AssignedTo', value: assignedTo });
+  if (assignOp) ops.push(assignOp);
   const r = await ax().post(`${BASE}/wit/workitems/$${encodeURIComponent(TYPE)}?api-version=${API}`, ops, PATCH);
   const id = r.data.id;
   console.log(`✅ Criado ${TYPE} ${id}: ${title}`);
@@ -455,20 +475,27 @@ async function cmdLink(id, opt) {
   const card = readCard(req(opt.card, '--card'));
   const estimativa = parseEstimate(card.fm.estimativa);
   if (estimativa === null) warn(`Card ${card.code || card.name} sem "estimativa:"; o link segue sem OriginalEstimate.`);
-  let title = card.title, state = '';
+  let title = card.title, state = '', assignOp = null;
   if (!opt['dry-run']) {
-    const it = await getItem(id, ['System.WorkItemType', 'System.Title', 'System.State']);
+    const it = await getItem(id, ['System.WorkItemType', 'System.Title', 'System.State', 'System.AssignedTo']);
     if (it.fields['System.WorkItemType'] !== TYPE) warn(`${id} é ${it.fields['System.WorkItemType']}, não ${TYPE}.`);
     title = it.fields['System.Title']; state = it.fields['System.State'];
-    console.log(`🔗 ${id} | ${state} | ${title}${estimativa !== null ? ` | estimativa ${estimativa}h` : ''}`);
-  } else console.log(`[dry-run] ligaria ${id} ao card ${card.code || card.name}${estimativa !== null ? ` (OriginalEstimate = ${estimativa})` : ''}`);
+    assignOp = await assignedToOp(opt, it.fields['System.AssignedTo']);
+    console.log(`🔗 ${id} | ${state} | ${title}${estimativa !== null ? ` | estimativa ${estimativa}h` : ''}${assignOp ? ` | responsável → ${assignOp.value}` : ''}`);
+  } else {
+    const target = opt.assign || process.env.HUB_CARD_ASSIGNEE || (await patUser()).uniqueName;
+    console.log(`[dry-run] ligaria ${id} ao card ${card.code || card.name}${estimativa !== null ? ` (OriginalEstimate = ${estimativa})` : ''} | responsável → ${target}`);
+  }
   if (opt['dry-run']) return;
   writeCardAzure(card, id);
-  if (estimativa !== null) {
-    const lops = [{ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.OriginalEstimate', value: estimativa }];
+  const lops = [];
+  if (estimativa !== null) lops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.OriginalEstimate', value: estimativa });
+  if (assignOp) lops.push(assignOp);
+  if (lops.length) {
     guardNoIteration('link', lops);
     await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, lops, PATCH);
-    console.log(`✅ ${id}: OriginalEstimate = ${estimativa}`);
+    if (estimativa !== null) console.log(`✅ ${id}: OriginalEstimate = ${estimativa}`);
+    if (assignOp) console.log(`✅ ${id}: AssignedTo → ${assignOp.value}`);
   }
   upsertPlan(opt, { card: card.code || card.name, azure: id, title, status: state });
 }
@@ -502,10 +529,11 @@ async function applyTransition(cmd, id, opt, card, hours) {
     history = `🤖 Agente: ${msg}${label}${bits.length ? ' — ' + bits.join(' · ') : ''}.${resumo ? '<br>' + resumo : ''}`;
   }
 
-  let current = '?', tags = [], title = card?.title || '';
+  let current = '?', tags = [], title = card?.title || '', currentAssigned = null;
   if (!opt['dry-run']) {
-    const it = await getItem(id, ['System.State', 'System.Tags', 'System.Title']);
+    const it = await getItem(id, ['System.State', 'System.Tags', 'System.Title', 'System.AssignedTo']);
     current = it.fields['System.State']; tags = splitTags(it.fields['System.Tags']); title = it.fields['System.Title'];
+    currentAssigned = it.fields['System.AssignedTo'];
     if (current === STATE.done && !opt.force) fail(`${id} já está Concluído. Use --force se for intencional.`);
     if (current === 'Cancelado' && !opt.force) fail(`${id} está Cancelado. Use --force se for intencional.`);
   }
@@ -517,10 +545,15 @@ async function applyTransition(cmd, id, opt, card, hours) {
     if (cmd === 'done') ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.RemainingWork', value: 0 });
   }
   ops.push({ op: 'add', path: '/fields/System.History', value: history });
+  if (!opt['dry-run']) {
+    const assignOp = await assignedToOp(opt, currentAssigned);
+    if (assignOp) ops.push(assignOp);
+  }
   guardNoIteration(cmd, ops);
 
   if (opt['dry-run']) {
-    console.log(`[dry-run] ${id}: estado → ${target}${hours !== null ? ` | horas ${hours}` : ''}`);
+    const targetAssignee = opt.assign || process.env.HUB_CARD_ASSIGNEE || (await patUser()).uniqueName;
+    console.log(`[dry-run] ${id}: estado → ${target}${hours !== null ? ` | horas ${hours}` : ''} | responsável → ${targetAssignee} (se diferente)`);
     console.log(`[dry-run] histórico: ${history.replace(/<[^>]+>/g, '').slice(0, 300)}`);
     return;
   }
@@ -602,24 +635,37 @@ async function cmdDescribe(id, opt) {
 
 async function cmdRehours(id, opt) {
   const row = readPlanRows(planPath(opt)).find(r => String(r.azure) === String(id));
+  const it = await getItem(id, ['System.State', 'System.Title', 'System.AssignedTo', 'Microsoft.VSTS.Scheduling.OriginalEstimate', 'Microsoft.VSTS.Scheduling.CompletedWork']);
+  const oe = it.fields['Microsoft.VSTS.Scheduling.OriginalEstimate'];
+  const cw = it.fields['Microsoft.VSTS.Scheduling.CompletedWork'];
+  const title = it.fields['System.Title'];
+  const assignOp = await assignedToOp(opt, it.fields['System.AssignedTo']);
+  const assignInfo = assignOp ? `${who(it.fields['System.AssignedTo'])} → ${assignOp.value}` : `${who(it.fields['System.AssignedTo'])} (sem alteração)`;
+  const originalOnly = !!opt['original-only'];
+
+  if (opt['assign-only']) {
+    if (opt['dry-run']) {
+      console.log(`[dry-run] ${id} | ${it.fields['System.State']} | ${title}`);
+      console.log(`[dry-run] AssignedTo: ${assignInfo}`);
+      return;
+    }
+    if (!assignOp) { console.log(`✅ ${id}: AssignedTo ${assignInfo}`); return; }
+    await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, [assignOp], PATCH);
+    console.log(`✅ ${id}: AssignedTo ${assignInfo}`);
+    return;
+  }
+
   const provided = opt.hours !== undefined ? Number(String(opt.hours).replace(',', '.')) : null;
   let value = provided;
   if (value === null || value === undefined || !Number.isFinite(value)) {
-    const oi = await getItem(id, ['Microsoft.VSTS.Scheduling.OriginalEstimate']);
-    const oe = Number(oi.fields['Microsoft.VSTS.Scheduling.OriginalEstimate']);
-    value = Number.isFinite(oe) && oe > 0 ? oe : findCardEstimate(id, process.cwd());
+    value = Number.isFinite(Number(oe)) && Number(oe) > 0 ? Number(oe) : findCardEstimate(id, process.cwd());
   }
   if (value === null || value === undefined || !Number.isFinite(value)) {
     throw new Error(`Sem --hours e sem OriginalEstimate/estimativa para ${id}.`);
   }
-  const it = await getItem(id, ['System.State', 'System.Title', 'Microsoft.VSTS.Scheduling.OriginalEstimate', 'Microsoft.VSTS.Scheduling.CompletedWork']);
-  const oe = it.fields['Microsoft.VSTS.Scheduling.OriginalEstimate'];
-  const cw = it.fields['Microsoft.VSTS.Scheduling.CompletedWork'];
-  const title = it.fields['System.Title'];
-  const originalOnly = !!opt['original-only'];
   if (opt['dry-run']) {
     console.log(`[dry-run] ${id} | ${it.fields['System.State']} | ${title}`);
-    console.log(`[dry-run] OriginalEstimate ${oe ?? '-'} → ${value} | CompletedWork ${cw ?? '-'} → ${originalOnly ? '(mantém)' : value} | RemainingWork → ${originalOnly ? '(mantém)' : 0} | plano: ${row ? row.card : '-'}${originalOnly ? ' (só OriginalEstimate)' : ''}`);
+    console.log(`[dry-run] OriginalEstimate ${oe ?? '-'} → ${value} | CompletedWork ${cw ?? '-'} → ${originalOnly ? '(mantém)' : value} | RemainingWork → ${originalOnly ? '(mantém)' : 0} | AssignedTo: ${assignInfo} | plano: ${row ? row.card : '-'}${originalOnly ? ' (só OriginalEstimate)' : ''}`);
     return;
   }
   const ops = originalOnly
@@ -629,9 +675,10 @@ async function cmdRehours(id, opt) {
         { op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.CompletedWork', value },
         { op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.RemainingWork', value: 0 },
       ];
+  if (assignOp) ops.push(assignOp);
   guardNoIteration('rehours', ops);
   await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
-  console.log(`✅ ${id}: OriginalEstimate ${oe ?? '-'} → ${value}${originalOnly ? '' : ` | CompletedWork ${cw ?? '-'} → ${value} | RemainingWork → 0`}`);
+  console.log(`✅ ${id}: OriginalEstimate ${oe ?? '-'} → ${value}${originalOnly ? '' : ` | CompletedWork ${cw ?? '-'} → ${value} | RemainingWork → 0`}${assignOp ? ` | AssignedTo ${assignInfo}` : ''}`);
   if (!originalOnly) upsertPlan(opt, { card: row?.card || title, azure: Number(id), title, hours: value });
 }
 
@@ -687,4 +734,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, pickAssignee, normalizeAssignedTo, guardNoIteration };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration };
