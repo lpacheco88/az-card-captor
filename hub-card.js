@@ -137,6 +137,10 @@ function readPlanRows(file) {
   }
   return rows;
 }
+function planPrFor(id, opt) {
+  const row = readPlanRows(planPath(opt)).find(r => String(r.azure) === String(id));
+  return row && row.pr ? row.pr : null;
+}
 
 // A branch foi mergeada na mainRef? Por ancestralidade ou pelo assunto do commit (squash / branch apagada).
 // Branch sem trabalho próprio (nada desde a criação no reflog) é "aberta", mesmo sendo ancestral da main.
@@ -305,23 +309,42 @@ function parseForaDoCodigo(md) {
     section.push(lines[i]);
   }
   const out = { front: [], pm: [], qa: [] };
-  let current = null;
+  let current = null, buffer = null;
   const label = /^\s*(?:[-*]\s*)?\**\s*(front|pm|qa)\s*\**\s*:\s*(.*)$/i;
+  const flush = () => {
+    if (buffer !== null) {
+      const t = buffer.replace(/\s+/g, ' ').trim();
+      if (t) out[current].push(t);
+      buffer = null;
+    }
+  };
   for (const raw of section) {
     const line = raw.replace(/\s+$/, '');
     const m = line.match(label);
     if (m) {
+      flush();
       current = m[1].toLowerCase();
-      const rest = m[2].replace(/\**/g, '').trim();
-      if (rest) out[current].push(rest);
+      buffer = m[2].replace(/\**/g, '').trim() || null;
       continue;
     }
     if (!current) continue;
-    const item = line.replace(/^\s*[-*]\s*/, '').replace(/\**/g, '').trim();
-    if (!item || /^#{1,6}\s/.test(item)) continue;
-    out[current].push(item);
+    const bullet = line.match(/^\s*[-*]\s+(.*)$/);
+    if (bullet) {
+      flush();
+      buffer = bullet[1].replace(/\**/g, '').trim() || null;
+      continue;
+    }
+    const text = line.trim();
+    if (!text || /^#{1,6}\s/.test(text)) continue;
+    if (buffer !== null) buffer += ' ' + text; else buffer = text;
   }
+  flush();
   return out;
+}
+
+function planNotifyPublics(parsed, to) {
+  if (!parsed) return [];
+  return to.filter(pub => (parsed[pub] || []).length > 0);
 }
 
 async function publishReviewComments(id, card, opt) {
@@ -343,14 +366,24 @@ async function publishReviewComments(id, card, opt) {
 }
 
 function mergeCommitShort(cwd, branch, code) {
+  const nb = branch ? branch.toLowerCase() : null;
+  const nc = code ? `(${code.toLowerCase()})` : null;
+  try {
+    const merges = git(`log origin/main --merges --format=%h%x09%s -n 500`, cwd).split('\n');
+    const m = merges.find(l => { const s = (l.split('\t')[1] || '').toLowerCase(); return (nb && s.includes(nb)) || (nc && s.includes(nc)); });
+    if (m) return m.split('\t')[0];
+  } catch { /* sem git */ }
   try {
     const lines = git(`log origin/main --format=%h%x09%s -n 2000`, cwd).split('\n');
-    const nc = code ? `(${code.toLowerCase()})` : null;
-    const nb = branch ? branch.toLowerCase() : null;
-    const hit = lines.find(l => { const [h, s] = l.split('\t'); const t = (s || '').toLowerCase(); return (nc && t.includes(nc)) || (nb && t.includes(nb)); });
+    const hit = lines.find(l => { const s = (l.split('\t')[1] || '').toLowerCase(); return (nc && s.includes(nc)) || (nb && s.includes(nb)); });
     if (hit) return hit.split('\t')[0];
   } catch { /* sem git */ }
-  try { return branch ? git(`rev-parse --short ${branch}`, cwd) : null; } catch { return null; }
+  try { return (branch && git(`rev-parse --short ${branch}`, cwd)) || null; } catch { return null; }
+}
+
+function doneReplyText(code, hash) {
+  if (!hash) return null;
+  return `${code ? code + ' ' : ''}entrou na main (commit ${hash})`;
 }
 
 async function maybeDoneReply(id, card, opt) {
@@ -368,7 +401,8 @@ async function maybeDoneReply(id, card, opt) {
   if (!mentioned.length) return; // somente people.json
   const code = card?.code || '';
   const hash = mergeCommitShort(process.cwd(), opt.branch, code);
-  const text = `🤖 ${code} entrou na main${hash ? ` (commit ${hash})` : ''}`;
+  const text = doneReplyText(code, hash);
+  if (!text) { warn(`sem hash de merge para ${id}; resposta de done não publicada.`); return; }
   const doneHash = contentHash('done|' + text);
   if (st.doneReply === doneHash) { console.log(`↩️  ${id} | resposta de done já publicada — ignorado`); return; }
   const html = `<p>${esc(text)}</p><p>${mentioned.map(p => mentionHtml(p)).join(' ')}</p>`;
@@ -921,18 +955,21 @@ async function cmdNotify(id, opt) {
   for (const p of to) if (!PUBLIC_KEYS.includes(p)) fail(`Público inválido: "${p}" (use front,pm,qa).`);
   if (!opt.md) fail('Informe --md <arquivo>.');
   const raw = fs.readFileSync(path.resolve(opt.md), 'utf8').replace(/^\uFEFF/, '');
-  const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, '');
+  const parsed = parseForaDoCodigo(raw);
+  if (!parsed) { warn(`Arquivo ${path.basename(String(opt.md))} sem seção "Fora do código"; nada publicado.`); return; }
+  const pubs = planNotifyPublics(parsed, to);
+  if (!pubs.length) { warn('Nenhum público escolhido tem itens em "Fora do código"; nada publicado.'); return; }
   const it = await getItem(id, ['System.WorkItemType', 'System.Title']);
   const code = ((it.fields['System.Title'] || '').match(/^Back\s*[—-]\s*(\S+)/i) || [])[1] || '';
-  const header = opt.pr ? `<p>🤖 ${esc(code)} — PR aberto: <a href="${attr(String(opt.pr))}">${esc(String(opt.pr))}</a></p>` : '';
-  let any = false;
-  for (const pub of to) {
+  let pr = typeof opt.pr === 'string' ? opt.pr : '';
+  if (!pr && opt.pr === true) pr = planPrFor(id, opt) || '';
+  if (opt.pr && !pr) warn(`PR não informado e não encontrado no plano para ${id}; comentário sem link.`);
+  const header = pr ? `<p>🤖 ${esc(code)} — PR aberto: <a href="${attr(pr)}">${esc(pr)}</a></p>` : '';
+  for (const pub of pubs) {
     const people = await resolvedPeople([pub]);
-    if (!people.length) { warn(`${pub}: ninguém resolvido no people.json; ignorado.`); continue; }
-    any = true;
-    await publishPublic(id, pub, 'notify', body, header, people, !!opt['dry-run']);
+    if (!people.length) { warn(`${pub}: ninguém resolvido no people.json; nenhum comentário.`); continue; }
+    await publishPublic(id, pub, 'notify', parsed[pub].map(i => `- ${i}`).join('\n'), header, people, !!opt['dry-run']);
   }
-  if (!any) fail('Nenhum público com pessoa resolvida no people.json.');
 }
 
 async function cmdPeopleResolve(opt) {
@@ -980,4 +1017,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, mentionHtml, publishDecision };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, mentionHtml, publishDecision, planNotifyPublics, doneReplyText };

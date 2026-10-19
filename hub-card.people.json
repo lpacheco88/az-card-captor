@@ -2,19 +2,22 @@
   "front": [
     {
       "name": "Thiago Suzuki",
-      "email": "thiago.suzuki@nstech.com.br"
+      "email": "thiago.suzuki@nstech.com.br",
+      "id": "dc712060-4470-4450-bd0d-df41ea4b1d69"
     }
   ],
   "pm": [
     {
       "name": "Rafael Tonetti",
-      "email": "<confirmar>"
+      "email": "<confirmar>",
+      "id": "8dc22968-1f77-49a1-b8f3-c9f42cc58494"
     }
   ],
   "qa": [
     {
       "name": "Tainã Ribas",
-      "email": "<confirmar>"
+      "email": "<confirmar>",
+      "id": "2107c87c-5738-4fb6-8c76-86741533fdf9"
     }
   ]
 }
