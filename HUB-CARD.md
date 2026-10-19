@@ -9,7 +9,7 @@ nunca aparece na saída.
 | Card novo, sem número no Azure | `... create --card "Claude outputs/card-X.md" --parent <feature>` (ou `--like <task code irmão>`) | Não iniciado |
 | Card que já existe no Azure | `... link <id> --card "Claude outputs/card-X.md"` | — |
 | Começou a implementar | `... start --card "Claude outputs/card-X.md" --branch <branch>` | Codificação |
-| PR aberto | `... review --card ... --pr <link>` | Code review |
+| PR aberto | `... review --card ... --pr <link> [--no-notify]` | Code review |
 | PR mergeado | `... done --card ... [--hours <N>] [--resumo <md>]` | Concluído |
 | Fechar os cards já mergeados | `... sync [--dry-run]` | Concluído nos mergeados |
 | Ajustar horas (estimativa) | `... rehours <id> [--hours N] [--dry-run]` | Sem mudar o estado |
@@ -49,7 +49,7 @@ Pessoas em **`hub-card.people.json`** (`front`, `pm`, `qa`). `people resolve [--
     - ...
   ```
 
-  Sem a seção (ou sem itens), não publica nada e avisa.
+  Sem a seção (ou sem itens), não publica nada e avisa. Use **`--no-notify`** no `review` para fazer só a transição para **Code review** sem publicar comentários.
 - **`done`** (inclusive pelo `sync`): se o card já tiver **comentário publicado pelo hub-card** (`notify` ou `review`), responde **uma vez** com `<card> entrou na main (commit <hash>)` marcando as mesmas pessoas. Sem comentário anterior, não publica.
 - **`reply <id> [--note "<texto>"] [--dry-run]`**: publica a resposta de "entrou na main" **sob demanda**, com a linha extra opcional do `--note`. Só funciona se o card já tiver comentário publicado pelo hub-card; senão, avisa e não publica.
 - **Sem duplicar**: estado em `hub-card.notify-state.json` (hash do conteúdo + público). Mesmo conteúdo não republica; conteúdo novo vira **"Atualização:"**. Nunca menciona pessoa fora do `people.json`; não edita nem apaga comentários; o comentário sai com a identidade do PAT; nenhum outro campo do card muda.

@@ -5,8 +5,9 @@
 //   node hub-card.js get <id>                               mostra o card e o pai
 //   node hub-card.js create --card <md> (--parent <id> | --like <taskId>) [--title "..."] [--assign <email>]
 //   node hub-card.js link <id> --card <md>                  liga um card que já existe no Azure ao nosso card
+//   node hub-card.js link <id> --related <id> [--dry-run]   cria a relação "Related" entre dois work items
 //   node hub-card.js start  (<id> | --card <md>) [--branch <b>]            -> Codificação
-//   node hub-card.js review (<id> | --card <md>) --pr <url> [--branch <b>] -> Code review
+//   node hub-card.js review (<id> | --card <md>) --pr <url> [--branch <b>] [--no-notify] -> Code review
 //   node hub-card.js done   (<id> | --card <md>) [--hours N] [--resumo <md>] [--pr <url>] -> Concluído
 //                                                            (sem --hours: OriginalEstimate > estimativa do card)
 //   node hub-card.js sync [--dry-run]                        fecha (done) os cards do plano cuja branch já está mergeada na origin/main
@@ -739,6 +740,21 @@ async function cmdCreate(opt) {
 }
 
 async function cmdLink(id, opt) {
+  if (opt.related) {
+    const target = Number(req(opt.related, '--related <id>'));
+    const it = await ax().get(`${BASE}/wit/workitems/${id}?$expand=relations&api-version=${API}`);
+    const targetIt = await getItem(target, ['System.WorkItemType', 'System.Title']);
+    const rels = it.data.relations || [];
+    const already = rels.some(r => r.rel === 'System.LinkTypes.Related' && Number((String(r.url).match(/\/workItems\/(\d+)$/i) || [])[1]) === target);
+    console.log(`${id} | ${it.data.fields['System.Title']} ↔ Related → ${target} | ${targetIt.fields['System.Title']}`);
+    if (already) { console.log(`✔ ${id} já relacionado ao ${target}; nada a fazer.`); return; }
+    if (opt['dry-run']) { console.log(`[dry-run] criaria a relação Related ${id} ↔ ${target}; parent e sprint não mudam`); return; }
+    const ops = [{ op: 'add', path: '/relations/-', value: { rel: 'System.LinkTypes.Related', url: `https://dev.azure.com/${ORG}/_apis/wit/workItems/${target}` } }];
+    guardNoIteration('link', ops);
+    await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
+    console.log(`✅ ${id} ↔ Related → ${target} criado.`);
+    return;
+  }
   const card = readCard(req(opt.card, '--card'));
   const estimativa = parseEstimate(card.fm.estimativa);
   if (estimativa === null) warn(`Card ${card.code || card.name} sem "estimativa:"; o link segue sem OriginalEstimate.`);
@@ -780,7 +796,8 @@ async function cmdTransition(cmd, id, opt, card) {
   if (hours !== null && (!Number.isFinite(hours) || hours < 0)) fail('--hours deve ser um número ≥ 0.');
   const res = await applyTransition(cmd, id, opt, card, hours);
   if (cmd === 'review') {
-    if (!card) warn('review sem --card: não é possível ler "Fora do código"; nada publicado.');
+    if (opt['no-notify']) console.log('ℹ️  --no-notify: comentários do review pulados.');
+    else if (!card) warn('review sem --card: não é possível ler "Fora do código"; nada publicado.');
     else await publishReviewComments(id, card, opt);
   }
   return res;
