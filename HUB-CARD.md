@@ -15,6 +15,8 @@ nunca aparece na saída.
 | Ajustar horas (estimativa) | `... rehours <id> [--hours N] [--dry-run]` | Sem mudar o estado |
 | Card no board errado | `... reparent <id> (--like <task code> | --parent <id>) --confirm` | Move o pai e a área/iteração |
 | Mover um card para a sprint atual | `... retarget <id> --confirm [--dry-run]` | Sprint atual do time (sem mudar estado/pai) |
+| Comunicar front/PM/QA | `... notify <id> --to front,pm,qa --md <arquivo> [--pr <link>] [--dry-run]` | — |
+| Resolver pessoas | `... people resolve [--write]` | — |
 | `describe <id> --md <arquivo>` | Acrescenta ou substitui a seção "🤖 Situação do backend" no fim da Descrição, sem apagar o texto do PM | — |
 
 - `create`/`link` gravam `azure: <id>` no cabeçalho do card e a linha em `Claude outputs/plano-cards.md` (colunas: Card, Azure, Título, Branch, Status, PR, **Horas**, Atualizado; o `done`/`rehours` grava as horas na coluna Horas).
@@ -27,6 +29,29 @@ nunca aparece na saída.
 - **Responsável**: todo card do fluxo é atribuído ao **usuário autenticado do PAT** (hoje `luciano.pacheco@nstech.com.br`, lido de `connectionData`). `create`, `link`, `start`, `review`, `done` (inclusive pelo `sync`) e `rehours` leem `System.AssignedTo` e, se não for esse usuário, atribuem — na **mesma** chamada do comando, sem histórico extra. **`--assign`** → **`HUB_CARD_ASSIGNEE`** (variável de ambiente, fora do `.env`) ainda sobrescrevem; o `AssignedTo` do irmão (`--like`) **não** é mais usado. Nunca toca card fora do fluxo.
 - `retarget <id> [--dry-run]` move um card **já criado** para a sprint atual do time, **sem** mudar estado nem pai (só `System.IterationPath` + histórico).
 - **Mudar a sprint de um card existente só com `--confirm` e por ordem do Luciano.** `retarget` e `reparent` sem `--confirm` apenas mostram o que fariam e saem com aviso. **Nenhum outro comando** (`rehours`, `done`, `sync`, `link`, `start`, `review`, `describe`) grava `System.IterationPath`; só o `create` define a sprint do card **novo** (sprint atual do time).
+## Comunicação com front, PM e QA
+
+Pessoas em **`hub-card.people.json`** (`front`, `pm`, `qa`). `people resolve [--write]` busca as identidades (pelo e-mail; sem e-mail, pelo nome), mostra nome/e-mail/id e **só grava o `id` com `--write` após confirmação**.
+
+- **`notify <id> --to front,pm,qa --md <arquivo> [--pr <link>] [--dry-run]`**: publica o conteúdo do `.md` (HTML simples) no card, marcando as pessoas dos públicos escolhidos. `--dry-run` mostra o HTML e quem seria marcado, sem publicar.
+- **Menção**: `<a href="#" data-vss-mention="version:2.0,{id}">@Nome</a>` (dispara a notificação).
+- **`review --card ... --pr <link>`**: lê a seção do card cujo título contém **"Fora do código"** e publica **um comentário por público** com os itens `Front:`, `PM:`, `QA:` (com ou sem negrito):
+
+  ```
+  ## 6. Fora do código (descrição do PR)
+
+  - **Front:**
+    - ...
+  - **PM:**
+    - ...
+  - **QA:**
+    - ...
+  ```
+
+  Sem a seção (ou sem itens), não publica nada e avisa.
+- **`done`** (inclusive pelo `sync`): se o `review` publicou comentários nesse card, responde **uma vez** com `🤖 <card> entrou na main (commit <hash>)` marcando as mesmas pessoas.
+- **Sem duplicar**: estado em `hub-card.notify-state.json` (hash do conteúdo + público). Mesmo conteúdo não republica; conteúdo novo vira **"Atualização:"**. Nunca menciona pessoa fora do `people.json`; não edita nem apaga comentários; o comentário sai com a identidade do PAT; nenhum outro campo do card muda.
+
 ## Horas do card = estimativa de dev sênior (front matter `estimativa:`)
 
 Sem cálculo pelo git. O valor vem do campo **`estimativa:`** no cabeçalho do card `.md`.

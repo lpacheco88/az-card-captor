@@ -25,6 +25,7 @@ const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
 const axios = require('axios');
 const { execSync } = require('child_process');
+const crypto = require('crypto');
 
 const { AZURE_DEVOPS_ORG: ORG, AZURE_DEVOPS_PROJECT: PROJECT, AZURE_DEVOPS_PAT: PAT, TARGET_EPIC_ID: EPIC } = process.env;
 const DEFAULT_TEAM = 'Industria';                        // time padrão do board (HUB_CARD_TEAM sobrescreve)
@@ -177,6 +178,206 @@ function detectMerged(cwd, branch, code, mainRef = 'origin/main') {
   return { merged: false, ref };
 }
 function fmtHours(h) { return `${String(h).replace('.', ',')}h`; }
+
+// ---------- pessoas / comentários (front, PM, QA) ----------
+const PEOPLE_FILE = path.join(__dirname, 'hub-card.people.json');
+const NOTIFY_STATE_FILE = path.join(__dirname, 'hub-card.notify-state.json');
+const NOTIFY_API = '7.0-preview.3';
+const PUBLIC_KEYS = ['front', 'pm', 'qa'];
+
+function readPeople() {
+  try { return JSON.parse(fs.readFileSync(PEOPLE_FILE, 'utf8')); } catch { return { front: [], pm: [], qa: [] }; }
+}
+function writePeople(p) { fs.writeFileSync(PEOPLE_FILE, JSON.stringify(p, null, 2) + '\n', 'utf8'); }
+function readNotifyState() { try { return JSON.parse(fs.readFileSync(NOTIFY_STATE_FILE, 'utf8')); } catch { return {}; } }
+function writeNotifyState(s) { fs.writeFileSync(NOTIFY_STATE_FILE, JSON.stringify(s, null, 2) + '\n', 'utf8'); }
+function contentHash(s) { return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 16); }
+function norm(s) { return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase(); }
+function attr(s) { return esc(String(s)).replace(/"/g, '&quot;'); }
+
+let _epicIds;
+async function epicIdentities() {
+  if (_epicIds) return _epicIds;
+  const epic = Number(EPIC);
+  if (!epic) return (_epicIds = []);
+  const w = await ax().post(`${BASE}/wit/wiql?api-version=${API}`, {
+    query: `SELECT [System.Id] FROM WorkItemLinks WHERE ([Source].[System.Id] = ${epic} AND [System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward') MODE (Recursive)`,
+  });
+  const ids = [...new Set((w.data.workItemRelations || []).flatMap(r => [r.source && r.source.id, r.target && r.target.id]).filter(Boolean))];
+  const map = new Map();
+  for (let i = 0; i < ids.length; i += 200) {
+    const r = await ax().get(`${BASE}/wit/workitems?ids=${ids.slice(i, i + 200).join(',')}&fields=System.AssignedTo,System.CreatedBy,System.ChangedBy&api-version=${API}`);
+    for (const x of (r.data.value || [])) for (const f of ['System.AssignedTo', 'System.CreatedBy', 'System.ChangedBy']) {
+      const v = x.fields[f];
+      if (v && typeof v === 'object' && v.id) map.set(v.id, { id: v.id, displayName: v.displayName || '', uniqueName: v.uniqueName || '' });
+    }
+  }
+  return (_epicIds = [...map.values()]);
+}
+
+// Busca por e-mail (exato) ou nome (tokens, sem acento). Tenta a API de identidades; cai para o scan do épico (401).
+async function resolvePerson(p) {
+  const email = p.email && !/confirmar/i.test(p.email) ? p.email : null;
+  const term = email || p.name;
+  let list = [], source = 'identities';
+  try {
+    const r = await ax().get(`https://dev.azure.com/${ORG}/_apis/identities?searchFilter=General&filterValue=${encodeURIComponent(term)}&api-version=7.0`);
+    list = (r.data.value || []).map(x => ({ id: x.id, displayName: x.providerDisplayName || x.displayName || '', uniqueName: (x.properties && x.properties.Account && x.properties.Account.$value) || x.uniqueName || '' }));
+  } catch { source = 'workitems'; }
+  if (!list.length) {
+    const all = await epicIdentities();
+    if (email) list = all.filter(v => norm(v.uniqueName) === norm(email));
+    else {
+      const tokens = norm(term).split(/\s+/).filter(Boolean);
+      list = all.filter(v => tokens.every(t => norm(`${v.displayName} ${v.uniqueName}`).includes(t)));
+    }
+  }
+  let chosen = null;
+  if (email) chosen = list.find(v => norm(v.uniqueName) === norm(email)) || null;
+  if (!chosen && list.length === 1) chosen = list[0];
+  return { term, source, candidates: list, chosen };
+}
+
+function mentionHtml(person) {
+  return `<a href="#" data-vss-mention="version:2.0,${person.id}">@${esc(person.displayName || person.name || '')}</a>`;
+}
+
+async function resolvedPeople(publics) {
+  const people = readPeople();
+  const out = [];
+  for (const pub of publics) {
+    for (const p of (people[pub] || [])) {
+      let person = { ...p };
+      if (!person.id) {
+        const r = await resolvePerson(person);
+        if (r.chosen) person = { ...person, id: r.chosen.id, displayName: r.chosen.displayName, uniqueName: r.chosen.uniqueName };
+      }
+      if (person.id) out.push({ public: pub, ...person, html: mentionHtml(person) });
+    }
+  }
+  return out;
+}
+
+function publishDecision(prev, hash, kind) {
+  if (prev && prev.hash === hash && prev.kind === kind) return 'skip';
+  return prev ? 'update' : 'new';
+}
+
+// Publica um comentário por público (com dedup por hash). dryRun não grava.
+async function publishPublic(workItemId, pub, kind, bodyMd, headerHtml, people, dryRun) {
+  const state = readNotifyState();
+  const key = String(workItemId);
+  const prev = state[key] && state[key].comments && state[key].comments[pub];
+  const hash = contentHash(`${kind}|${bodyMd}`);
+  const decision = publishDecision(prev, hash, kind);
+  const mentions = people.map(p => p.html).join(' ');
+  const prefix = decision === 'update' ? '<p>Atualização:</p>' : '';
+  const html = `${prefix}${headerHtml || ''}${mdToHtml(bodyMd)}${mentions ? `<p>${mentions}</p>` : ''}`;
+  if (decision === 'skip') { console.log(`↩️  ${workItemId} | ${pub} | já publicado (mesmo conteúdo) — ignorado`); return { skipped: true }; }
+  if (dryRun) {
+    console.log(`\n----- [dry-run] ${workItemId} | ${pub} | ${kind}${decision === 'update' ? ' (Atualização)' : ''} -----`);
+    console.log(`mencionados: ${people.map(p => `${p.displayName || p.name} <${p.id}>`).join(', ') || '(nenhum)'}`);
+    console.log(html);
+    return { skipped: false, html };
+  }
+  await ax().post(`${BASE}/wit/workItems/${workItemId}/comments?api-version=${NOTIFY_API}`, { text: html }, { headers: { 'Content-Type': 'application/json' } });
+  state[key] = state[key] || { comments: {}, reviewMentionIds: [] };
+  state[key].comments[pub] = { hash, kind, at: new Date().toISOString() };
+  if (kind === 'review') state[key].reviewMentionIds = [...new Set([...(state[key].reviewMentionIds || []), ...people.map(p => p.id)])];
+  writeNotifyState(state);
+  console.log(`💬 ${workItemId} | ${pub} | ${kind} | publicado (${people.length} menção(ões))`);
+  return { skipped: false, html };
+}
+
+// Parser da seção "Fora do código": itens "Front:", "PM:", "QA:" (com ou sem negrito).
+function parseForaDoCodigo(md) {
+  const lines = String(md).replace(/\r\n/g, '\n').split('\n');
+  let start = -1, level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const h = lines[i].match(/^(#{1,6})\s+(.*)$/);
+    if (h && /fora do c[oó]digo/i.test(h[2])) { start = i; level = h[1].length; break; }
+  }
+  if (start < 0) return null;
+  const section = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const h = lines[i].match(/^(#{1,6})\s+/);
+    if (h && h[1].length <= level) break;
+    section.push(lines[i]);
+  }
+  const out = { front: [], pm: [], qa: [] };
+  let current = null;
+  const label = /^\s*(?:[-*]\s*)?\**\s*(front|pm|qa)\s*\**\s*:\s*(.*)$/i;
+  for (const raw of section) {
+    const line = raw.replace(/\s+$/, '');
+    const m = line.match(label);
+    if (m) {
+      current = m[1].toLowerCase();
+      const rest = m[2].replace(/\**/g, '').trim();
+      if (rest) out[current].push(rest);
+      continue;
+    }
+    if (!current) continue;
+    const item = line.replace(/^\s*[-*]\s*/, '').replace(/\**/g, '').trim();
+    if (!item || /^#{1,6}\s/.test(item)) continue;
+    out[current].push(item);
+  }
+  return out;
+}
+
+async function publishReviewComments(id, card, opt) {
+  const parsed = parseForaDoCodigo(card.body);
+  if (!parsed) { warn(`Card ${card.code || card.name} sem seção "Fora do código"; nada publicado.`); return; }
+  const code = card.code || '';
+  const pr = String(opt.pr);
+  const header = `<p>🤖 ${esc(code)} — PR aberto: <a href="${attr(pr)}">${esc(pr)}</a></p>`;
+  let any = false;
+  for (const pub of PUBLIC_KEYS) {
+    const items = parsed[pub] || [];
+    if (!items.length) continue;
+    any = true;
+    const people = await resolvedPeople([pub]);
+    if (!people.length) { warn(`${pub}: ninguém resolvido no people.json; comentário não publicado.`); continue; }
+    await publishPublic(id, pub, 'review', items.map(i => `- ${i}`).join('\n'), header, people, !!opt['dry-run']);
+  }
+  if (!any) warn(`Card ${card.code || card.name}: seção "Fora do código" sem itens Front/PM/QA; nada publicado.`);
+}
+
+function mergeCommitShort(cwd, branch, code) {
+  try {
+    const lines = git(`log origin/main --format=%h%x09%s -n 2000`, cwd).split('\n');
+    const nc = code ? `(${code.toLowerCase()})` : null;
+    const nb = branch ? branch.toLowerCase() : null;
+    const hit = lines.find(l => { const [h, s] = l.split('\t'); const t = (s || '').toLowerCase(); return (nc && t.includes(nc)) || (nb && t.includes(nb)); });
+    if (hit) return hit.split('\t')[0];
+  } catch { /* sem git */ }
+  try { return branch ? git(`rev-parse --short ${branch}`, cwd) : null; } catch { return null; }
+}
+
+async function maybeDoneReply(id, card, opt) {
+  const state = readNotifyState();
+  const st = state[String(id)];
+  if (!st || !st.comments) return;
+  const reviewPubs = PUBLIC_KEYS.filter(p => st.comments[p] && st.comments[p].kind === 'review');
+  if (!reviewPubs.length) return;
+  const ids = st.reviewMentionIds || [];
+  if (!ids.length) return;
+  const people = readPeople();
+  const byId = new Map();
+  for (const pub of PUBLIC_KEYS) for (const p of (people[pub] || [])) if (p.id) byId.set(p.id, p);
+  const mentioned = ids.map(v => byId.get(v)).filter(Boolean);
+  if (!mentioned.length) return; // somente people.json
+  const code = card?.code || '';
+  const hash = mergeCommitShort(process.cwd(), opt.branch, code);
+  const text = `🤖 ${code} entrou na main${hash ? ` (commit ${hash})` : ''}`;
+  const doneHash = contentHash('done|' + text);
+  if (st.doneReply === doneHash) { console.log(`↩️  ${id} | resposta de done já publicada — ignorado`); return; }
+  const html = `<p>${esc(text)}</p><p>${mentioned.map(p => mentionHtml(p)).join(' ')}</p>`;
+  if (opt['dry-run']) { console.log(`\n----- [dry-run] ${id} | done (resposta) -----\n${html}`); return; }
+  await ax().post(`${BASE}/wit/workItems/${id}/comments?api-version=${NOTIFY_API}`, { text: html }, { headers: { 'Content-Type': 'application/json' } });
+  st.doneReply = doneHash;
+  writeNotifyState(state);
+  console.log(`💬 ${id} | done | resposta publicada (${mentioned.length} menção(ões))`);
+}
 
 // ---------- markdown -> HTML (o suficiente para os nossos cards) ----------
 function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
@@ -511,7 +712,12 @@ async function cmdTransition(cmd, id, opt, card) {
     }
   }
   if (hours !== null && (!Number.isFinite(hours) || hours < 0)) fail('--hours deve ser um número ≥ 0.');
-  return applyTransition(cmd, id, opt, card, hours);
+  const res = await applyTransition(cmd, id, opt, card, hours);
+  if (cmd === 'review') {
+    if (!card) warn('review sem --card: não é possível ler "Fora do código"; nada publicado.');
+    else await publishReviewComments(id, card, opt);
+  }
+  return res;
 }
 
 async function applyTransition(cmd, id, opt, card, hours) {
@@ -562,6 +768,7 @@ async function applyTransition(cmd, id, opt, card, hours) {
   const planRow = { card: card?.code || card?.name, azure: id, title, branch: opt.branch, status: target, pr: opt.pr };
   if (cmd === 'done' && hours !== null) planRow.hours = hours;
   upsertPlan(opt, planRow);
+  if (cmd === 'done') await maybeDoneReply(id, card, opt);
 }
 
 async function cmdReparent(id, opt) {
@@ -708,6 +915,43 @@ async function cmdSync(opt) {
   }
 }
 
+async function cmdNotify(id, opt) {
+  const to = String(opt.to || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  if (!to.length) fail('Informe --to front,pm,qa.');
+  for (const p of to) if (!PUBLIC_KEYS.includes(p)) fail(`Público inválido: "${p}" (use front,pm,qa).`);
+  if (!opt.md) fail('Informe --md <arquivo>.');
+  const raw = fs.readFileSync(path.resolve(opt.md), 'utf8').replace(/^\uFEFF/, '');
+  const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, '');
+  const it = await getItem(id, ['System.WorkItemType', 'System.Title']);
+  const code = ((it.fields['System.Title'] || '').match(/^Back\s*[—-]\s*(\S+)/i) || [])[1] || '';
+  const header = opt.pr ? `<p>🤖 ${esc(code)} — PR aberto: <a href="${attr(String(opt.pr))}">${esc(String(opt.pr))}</a></p>` : '';
+  let any = false;
+  for (const pub of to) {
+    const people = await resolvedPeople([pub]);
+    if (!people.length) { warn(`${pub}: ninguém resolvido no people.json; ignorado.`); continue; }
+    any = true;
+    await publishPublic(id, pub, 'notify', body, header, people, !!opt['dry-run']);
+  }
+  if (!any) fail('Nenhum público com pessoa resolvida no people.json.');
+}
+
+async function cmdPeopleResolve(opt) {
+  const people = readPeople();
+  let changed = false;
+  for (const pub of PUBLIC_KEYS) {
+    for (const p of (people[pub] || [])) {
+      const r = await resolvePerson(p);
+      console.log(`\n[${pub}] ${p.name}${p.email ? ` (${p.email})` : ''} — busca "${r.term}" via ${r.source}`);
+      if (!r.candidates.length) { console.log('  nenhum candidato'); continue; }
+      r.candidates.forEach(c => console.log(`  id=${c.id} | ${c.displayName} | ${c.uniqueName}${r.chosen && r.chosen.id === c.id ? '  <= escolhido' : ''}`));
+      if (opt.write && r.chosen) { p.id = r.chosen.id; changed = true; console.log(`  ✅ id gravado: ${p.id}`); }
+      else if (!r.chosen) console.log('  (ambíguo; nada gravado — confirme o id)');
+    }
+  }
+  if (opt.write && changed) { writePeople(people); console.log('\npeople.json atualizado.'); }
+  else if (!opt.write) console.log('\n(dry: nada gravado; use --write após confirmar)');
+}
+
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const { pos, opt } = parseArgs(rest);
@@ -727,6 +971,8 @@ async function main() {
     case 'sync': return cmdSync(opt);
     case 'rehours': return cmdRehours(Number(req(pos[0], '<id>')), opt);
     case 'retarget': return cmdRetarget(Number(req(pos[0], '<id>')), opt);
+    case 'notify': return cmdNotify(Number(req(pos[0], '<id>')), opt);
+    case 'people': { if (pos[0] === 'resolve') return cmdPeopleResolve(opt); fail('Uso: people resolve [--write]'); }
     case 'start': case 'review': case 'done': { const { id, card } = idOrCard(); return cmdTransition(cmd, id, opt, card); }
     default:
       console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 17).map(l => l.replace(/^\/\/ ?/, '')).join('\n'));
@@ -734,4 +980,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, mentionHtml, publishDecision };
