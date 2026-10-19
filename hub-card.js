@@ -246,6 +246,15 @@ function mentionHtml(person) {
   return `<a href="#" data-vss-mention="version:2.0,${person.id}">@${esc(person.displayName || person.name || '')}</a>`;
 }
 
+function commentHeader(code, pr) {
+  return pr ? `<p>${esc(code)} — PR aberto: <a href="${attr(pr)}">${esc(pr)}</a></p>` : '';
+}
+
+// Remove a quebra de linha que o join do mdToHtml deixa antes dos fechamentos.
+function cleanCommentHtml(s) {
+  return String(s).replace(/\n(?=<\/(?:li|ul|ol)>)/g, '');
+}
+
 async function resolvedPeople(publics) {
   const people = readPeople();
   const out = [];
@@ -276,7 +285,7 @@ async function publishPublic(workItemId, pub, kind, bodyMd, headerHtml, people, 
   const decision = publishDecision(prev, hash, kind);
   const mentions = people.map(p => p.html).join(' ');
   const prefix = decision === 'update' ? '<p>Atualização:</p>' : '';
-  const html = `${prefix}${headerHtml || ''}${mdToHtml(bodyMd)}${mentions ? `<p>${mentions}</p>` : ''}`;
+  const html = cleanCommentHtml(`${prefix}${headerHtml || ''}${mdToHtml(bodyMd)}${mentions ? `<p>${mentions}</p>` : ''}`);
   if (decision === 'skip') { console.log(`↩️  ${workItemId} | ${pub} | já publicado (mesmo conteúdo) — ignorado`); return { skipped: true }; }
   if (dryRun) {
     console.log(`\n----- [dry-run] ${workItemId} | ${pub} | ${kind}${decision === 'update' ? ' (Atualização)' : ''} -----`);
@@ -284,13 +293,14 @@ async function publishPublic(workItemId, pub, kind, bodyMd, headerHtml, people, 
     console.log(html);
     return { skipped: false, html };
   }
-  await ax().post(`${BASE}/wit/workItems/${workItemId}/comments?api-version=${NOTIFY_API}`, { text: html }, { headers: { 'Content-Type': 'application/json' } });
+  const res = await ax().post(`${BASE}/wit/workItems/${workItemId}/comments?api-version=${NOTIFY_API}`, { text: html }, { headers: { 'Content-Type': 'application/json' } });
+  const commentId = res.data && (res.data.id || res.data.commentId);
   state[key] = state[key] || { comments: {}, reviewMentionIds: [] };
-  state[key].comments[pub] = { hash, kind, at: new Date().toISOString() };
+  state[key].comments[pub] = { hash, kind, at: new Date().toISOString(), commentId };
   if (kind === 'review') state[key].reviewMentionIds = [...new Set([...(state[key].reviewMentionIds || []), ...people.map(p => p.id)])];
   writeNotifyState(state);
-  console.log(`💬 ${workItemId} | ${pub} | ${kind} | publicado (${people.length} menção(ões))`);
-  return { skipped: false, html };
+  console.log(`💬 ${workItemId} | ${pub} | ${kind} | comentário ${commentId ?? '?'} publicado (${people.length} menção(ões))`);
+  return { skipped: false, html, commentId };
 }
 
 // Parser da seção "Fora do código": itens "Front:", "PM:", "QA:" (com ou sem negrito).
@@ -352,7 +362,7 @@ async function publishReviewComments(id, card, opt) {
   if (!parsed) { warn(`Card ${card.code || card.name} sem seção "Fora do código"; nada publicado.`); return; }
   const code = card.code || '';
   const pr = String(opt.pr);
-  const header = `<p>🤖 ${esc(code)} — PR aberto: <a href="${attr(pr)}">${esc(pr)}</a></p>`;
+  const header = commentHeader(code, pr);
   let any = false;
   for (const pub of PUBLIC_KEYS) {
     const items = parsed[pub] || [];
@@ -964,7 +974,7 @@ async function cmdNotify(id, opt) {
   let pr = typeof opt.pr === 'string' ? opt.pr : '';
   if (!pr && opt.pr === true) pr = planPrFor(id, opt) || '';
   if (opt.pr && !pr) warn(`PR não informado e não encontrado no plano para ${id}; comentário sem link.`);
-  const header = pr ? `<p>🤖 ${esc(code)} — PR aberto: <a href="${attr(pr)}">${esc(pr)}</a></p>` : '';
+  const header = commentHeader(code, pr);
   for (const pub of pubs) {
     const people = await resolvedPeople([pub]);
     if (!people.length) { warn(`${pub}: ninguém resolvido no people.json; nenhum comentário.`); continue; }
@@ -1017,4 +1027,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, mentionHtml, publishDecision, planNotifyPublics, doneReplyText };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, mentionHtml, commentHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText };
