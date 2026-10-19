@@ -17,6 +17,7 @@ nunca aparece na saída.
 | Mover um card para a sprint atual | `... retarget <id> --confirm [--dry-run]` | Sprint atual do time (sem mudar estado/pai) |
 | Comunicar front/PM/QA | `... notify <id> --to front,pm,qa --md <arquivo> [--pr <link>] [--dry-run]` | — |
 | Resolver pessoas | `... people resolve [--write]` | — |
+| Responder "entrou na main" | `... reply <id> [--note "<texto>"] [--dry-run]` | — |
 | `describe <id> --md <arquivo>` | Acrescenta ou substitui a seção "🤖 Situação do backend" no fim da Descrição, sem apagar o texto do PM | — |
 
 - `create`/`link` gravam `azure: <id>` no cabeçalho do card e a linha em `Claude outputs/plano-cards.md` (colunas: Card, Azure, Título, Branch, Status, PR, **Horas**, Atualizado; o `done`/`rehours` grava as horas na coluna Horas).
@@ -49,7 +50,8 @@ Pessoas em **`hub-card.people.json`** (`front`, `pm`, `qa`). `people resolve [--
   ```
 
   Sem a seção (ou sem itens), não publica nada e avisa.
-- **`done`** (inclusive pelo `sync`): se o `review` publicou comentários nesse card, responde **uma vez** com `🤖 <card> entrou na main (commit <hash>)` marcando as mesmas pessoas.
+- **`done`** (inclusive pelo `sync`): se o card já tiver **comentário publicado pelo hub-card** (`notify` ou `review`), responde **uma vez** com `<card> entrou na main (commit <hash>)` marcando as mesmas pessoas. Sem comentário anterior, não publica.
+- **`reply <id> [--note "<texto>"] [--dry-run]`**: publica a resposta de "entrou na main" **sob demanda**, com a linha extra opcional do `--note`. Só funciona se o card já tiver comentário publicado pelo hub-card; senão, avisa e não publica.
 - **Sem duplicar**: estado em `hub-card.notify-state.json` (hash do conteúdo + público). Mesmo conteúdo não republica; conteúdo novo vira **"Atualização:"**. Nunca menciona pessoa fora do `people.json`; não edita nem apaga comentários; o comentário sai com a identidade do PAT; nenhum outro campo do card muda.
 
 ## Horas do card = estimativa de dev sênior (front matter `estimativa:`)

@@ -141,6 +141,10 @@ function planPrFor(id, opt) {
   const row = readPlanRows(planPath(opt)).find(r => String(r.azure) === String(id));
   return row && row.pr ? row.pr : null;
 }
+function planBranchFor(id, opt) {
+  const row = readPlanRows(planPath(opt)).find(r => String(r.azure) === String(id));
+  return row && row.branch ? row.branch : null;
+}
 
 // A branch foi mergeada na mainRef? Por ancestralidade ou pelo assunto do commit (squash / branch apagada).
 // Branch sem trabalho próprio (nada desde a criação no reflog) é "aberta", mesmo sendo ancestral da main.
@@ -396,31 +400,49 @@ function doneReplyText(code, hash) {
   return `${code ? code + ' ' : ''}entrou na main (commit ${hash})`;
 }
 
-async function maybeDoneReply(id, card, opt) {
-  const state = readNotifyState();
+function mentionedForPublics(people, pubs) {
+  const out = [], seen = new Set();
+  for (const pub of pubs) for (const p of (people[pub] || [])) {
+    if (p.id && !seen.has(p.id)) { seen.add(p.id); out.push(p); }
+  }
+  return out;
+}
+function hasPublishedComments(state, id) {
   const st = state[String(id)];
-  if (!st || !st.comments) return;
-  const reviewPubs = PUBLIC_KEYS.filter(p => st.comments[p] && st.comments[p].kind === 'review');
-  if (!reviewPubs.length) return;
-  const ids = st.reviewMentionIds || [];
-  if (!ids.length) return;
-  const people = readPeople();
-  const byId = new Map();
-  for (const pub of PUBLIC_KEYS) for (const p of (people[pub] || [])) if (p.id) byId.set(p.id, p);
-  const mentioned = ids.map(v => byId.get(v)).filter(Boolean);
-  if (!mentioned.length) return; // somente people.json
-  const code = card?.code || '';
-  const hash = mergeCommitShort(process.cwd(), opt.branch, code);
+  return !!(st && st.comments && PUBLIC_KEYS.some(p => st.comments[p]));
+}
+
+// Resposta "entrou na main" (review OU notify publicados antes), marcando os mesmos públicos.
+async function publishDoneReply(id, opt) {
+  const state = readNotifyState();
+  if (!hasPublishedComments(state, id)) return { skipped: true, reason: 'sem comentário anterior' };
+  const st = state[String(id)];
+  const pubs = PUBLIC_KEYS.filter(p => st.comments[p]);
+  const mentioned = mentionedForPublics(readPeople(), pubs);
+  if (!mentioned.length) return { skipped: true, reason: 'sem pessoa do people.json' };
+  const it = await getItem(id, ['System.WorkItemType', 'System.Title']);
+  const code = ((it.fields['System.Title'] || '').match(/^Back\s*[—-]\s*(\S+)/i) || [])[1] || '';
+  const branch = opt.branch || planBranchFor(id, opt);
+  const hash = mergeCommitShort(process.cwd(), branch, code);
   const text = doneReplyText(code, hash);
-  if (!text) { warn(`sem hash de merge para ${id}; resposta de done não publicada.`); return; }
-  const doneHash = contentHash('done|' + text);
-  if (st.doneReply === doneHash) { console.log(`↩️  ${id} | resposta de done já publicada — ignorado`); return; }
-  const html = `<p>${esc(text)}</p><p>${mentioned.map(p => mentionHtml(p)).join(' ')}</p>`;
-  if (opt['dry-run']) { console.log(`\n----- [dry-run] ${id} | done (resposta) -----\n${html}`); return; }
-  await ax().post(`${BASE}/wit/workItems/${id}/comments?api-version=${NOTIFY_API}`, { text: html }, { headers: { 'Content-Type': 'application/json' } });
-  st.doneReply = doneHash;
+  if (!text) return { skipped: true, reason: 'sem hash de merge' };
+  const note = opt.note ? String(opt.note).trim() : '';
+  const key = contentHash('done|' + text + '|' + note);
+  if (st.doneReply === key) return { skipped: true, reason: 'já publicado' };
+  const html = `<p>${esc(text)}</p>${note ? `<p>${esc(note)}</p>` : ''}<p>${mentioned.map(p => mentionHtml(p)).join(' ')}</p>`;
+  if (opt['dry-run']) { console.log(`\n----- [dry-run] ${id} | entrou na main -----\n${html}`); return { skipped: false, html }; }
+  const res = await ax().post(`${BASE}/wit/workItems/${id}/comments?api-version=${NOTIFY_API}`, { text: html }, { headers: { 'Content-Type': 'application/json' } });
+  const commentId = res.data && (res.data.id || res.data.commentId);
+  st.doneReply = key;
+  st.doneReplyId = commentId;
   writeNotifyState(state);
-  console.log(`💬 ${id} | done | resposta publicada (${mentioned.length} menção(ões))`);
+  console.log(`💬 ${id} | entrou na main | comentário ${commentId ?? '?'} publicado (${mentioned.length} menção(ões))`);
+  return { skipped: false, html, commentId };
+}
+
+async function maybeDoneReply(id, card, opt) {
+  const r = await publishDoneReply(id, opt);
+  if (r.skipped) console.log(`↩️  ${id} | resposta de done não publicada: ${r.reason}`);
 }
 
 // ---------- markdown -> HTML (o suficiente para os nossos cards) ----------
@@ -982,6 +1004,14 @@ async function cmdNotify(id, opt) {
   }
 }
 
+async function cmdReply(id, opt) {
+  const r = await publishDoneReply(id, opt);
+  if (r.skipped) {
+    if (r.reason === 'sem comentário anterior') warn(`${id} não tem comentário publicado pelo hub-card; nada publicado.`);
+    else warn(`${id}: resposta não publicada (${r.reason}).`);
+  }
+}
+
 async function cmdPeopleResolve(opt) {
   const people = readPeople();
   let changed = false;
@@ -1019,6 +1049,7 @@ async function main() {
     case 'rehours': return cmdRehours(Number(req(pos[0], '<id>')), opt);
     case 'retarget': return cmdRetarget(Number(req(pos[0], '<id>')), opt);
     case 'notify': return cmdNotify(Number(req(pos[0], '<id>')), opt);
+    case 'reply': return cmdReply(Number(req(pos[0], '<id>')), opt);
     case 'people': { if (pos[0] === 'resolve') return cmdPeopleResolve(opt); fail('Uso: people resolve [--write]'); }
     case 'start': case 'review': case 'done': { const { id, card } = idOrCard(); return cmdTransition(cmd, id, opt, card); }
     default:
@@ -1027,4 +1058,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, mentionHtml, commentHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, mentionHtml, commentHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments };
