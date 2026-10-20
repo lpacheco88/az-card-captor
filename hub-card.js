@@ -255,6 +255,11 @@ function commentHeader(code, pr) {
   return pr ? `<p>${esc(code)} — PR aberto: <a href="${attr(pr)}">${esc(pr)}</a></p>` : '';
 }
 
+// Cabeçalho do notify: --header sobrescreve o padrão "— PR aberto".
+function notifyHeader(opt, code, pr) {
+  return opt.header ? `<p>${esc(String(opt.header))}</p>` : commentHeader(code, pr);
+}
+
 // Remove a quebra de linha que o join do mdToHtml deixa antes dos fechamentos.
 function cleanCommentHtml(s) {
   return String(s).replace(/\n(?=<\/(?:li|ul|ol)>)/g, '');
@@ -1013,7 +1018,7 @@ async function cmdNotify(id, opt) {
   let pr = typeof opt.pr === 'string' ? opt.pr : '';
   if (!pr && opt.pr === true) pr = planPrFor(id, opt) || '';
   if (opt.pr && !pr) warn(`PR não informado e não encontrado no plano para ${id}; comentário sem link.`);
-  const header = commentHeader(code, pr);
+  const header = notifyHeader(opt, code, pr);
   for (const pub of pubs) {
     const people = await resolvedPeople([pub]);
     if (!people.length) { warn(`${pub}: ninguém resolvido no people.json; nenhum comentário.`); continue; }
@@ -1075,4 +1080,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, mentionHtml, commentHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments };
