@@ -260,9 +260,9 @@ function notifyHeader(opt, code, pr) {
   return opt.header ? `<p>${esc(String(opt.header))}</p>` : commentHeader(code, pr);
 }
 
-// Remove a quebra de linha que o join do mdToHtml deixa antes dos fechamentos.
+// Remove a quebra de linha que o join do mdToHtml deixa antes de abrir/fechar listas.
 function cleanCommentHtml(s) {
-  return String(s).replace(/\n(?=<\/(?:li|ul|ol)>)/g, '');
+  return String(s).replace(/\n(?=<\/?(?:ul|ol|li)\b)/g, '');
 }
 
 async function resolvedPeople(publics) {
@@ -362,25 +362,71 @@ function parseForaDoCodigo(md) {
   return out;
 }
 
+// Blocos markdown por público, preservando a indentação (listas aninhadas) e juntando continuações.
+function foraDoCodigoBlocks(md) {
+  const lines = String(md).replace(/\r\n/g, '\n').split('\n');
+  let start = -1, level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const h = lines[i].match(/^(#{1,6})\s+(.*)$/);
+    if (h && /fora do c[oó]digo/i.test(h[2])) { start = i; level = h[1].length; break; }
+  }
+  if (start < 0) return null;
+  const section = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const h = lines[i].match(/^(#{1,6})\s+/);
+    if (h && h[1].length <= level) break;
+    section.push(lines[i]);
+  }
+  const out = { front: [], pm: [], qa: [] };
+  let current = null, baseIndent = 0, last = null;
+  const label = /^(\s*)(?:[-*]\s*)?\**\s*(front|pm|qa)\s*\**\s*:\s*(.*)$/i;
+  for (const raw of section) {
+    const m = raw.match(label);
+    if (m) {
+      current = m[2].toLowerCase();
+      baseIndent = m[1].length;
+      const rest = m[3].replace(/\**/g, '').trim();
+      last = null;
+      if (rest) { last = { indent: 0, text: rest }; out[current].push(last); }
+      continue;
+    }
+    if (!current) continue;
+    const bullet = raw.match(/^(\s*)[-*]\s+(.*)$/);
+    if (bullet) {
+      const indent = Math.max(0, bullet[1].length - baseIndent);
+      const text = bullet[2].replace(/\**/g, '').trim();
+      last = { indent, text };
+      out[current].push(last);
+      continue;
+    }
+    const text = raw.trim();
+    if (!text) continue;
+    if (last) last.text += ' ' + text;
+  }
+  const blocks = {};
+  for (const pub of ['front', 'pm', 'qa']) blocks[pub] = out[pub].map(it => `${' '.repeat(it.indent)}- ${it.text}`).join('\n');
+  return blocks;
+}
+
 function planNotifyPublics(parsed, to) {
   if (!parsed) return [];
   return to.filter(pub => (parsed[pub] || []).length > 0);
 }
 
 async function publishReviewComments(id, card, opt) {
-  const parsed = parseForaDoCodigo(card.body);
-  if (!parsed) { warn(`Card ${card.code || card.name} sem seção "Fora do código"; nada publicado.`); return; }
+  const blocks = foraDoCodigoBlocks(card.body);
+  if (!blocks) { warn(`Card ${card.code || card.name} sem seção "Fora do código"; nada publicado.`); return; }
   const code = card.code || '';
   const pr = String(opt.pr);
   const header = commentHeader(code, pr);
   let any = false;
   for (const pub of PUBLIC_KEYS) {
-    const items = parsed[pub] || [];
-    if (!items.length) continue;
+    const bodyMd = blocks[pub] || '';
+    if (!bodyMd.trim()) continue;
     any = true;
     const people = await resolvedPeople([pub]);
     if (!people.length) { warn(`${pub}: ninguém resolvido no people.json; comentário não publicado.`); continue; }
-    await publishPublic(id, pub, 'review', items.map(i => `- ${i}`).join('\n'), header, people, !!opt['dry-run']);
+    await publishPublic(id, pub, 'review', bodyMd, header, people, !!opt['dry-run']);
   }
   if (!any) warn(`Card ${card.code || card.name}: seção "Fora do código" sem itens Front/PM/QA; nada publicado.`);
 }
@@ -1009,9 +1055,9 @@ async function cmdNotify(id, opt) {
   for (const p of to) if (!PUBLIC_KEYS.includes(p)) fail(`Público inválido: "${p}" (use front,pm,qa).`);
   if (!opt.md) fail('Informe --md <arquivo>.');
   const raw = fs.readFileSync(path.resolve(opt.md), 'utf8').replace(/^\uFEFF/, '');
-  const parsed = parseForaDoCodigo(raw);
-  if (!parsed) { warn(`Arquivo ${path.basename(String(opt.md))} sem seção "Fora do código"; nada publicado.`); return; }
-  const pubs = planNotifyPublics(parsed, to);
+  const blocks = foraDoCodigoBlocks(raw);
+  if (!blocks) { warn(`Arquivo ${path.basename(String(opt.md))} sem seção "Fora do código"; nada publicado.`); return; }
+  const pubs = to.filter(pub => (blocks[pub] || '').trim());
   if (!pubs.length) { warn('Nenhum público escolhido tem itens em "Fora do código"; nada publicado.'); return; }
   const it = await getItem(id, ['System.WorkItemType', 'System.Title']);
   const code = ((it.fields['System.Title'] || '').match(/^Back\s*[—-]\s*(\S+)/i) || [])[1] || '';
@@ -1022,7 +1068,7 @@ async function cmdNotify(id, opt) {
   for (const pub of pubs) {
     const people = await resolvedPeople([pub]);
     if (!people.length) { warn(`${pub}: ninguém resolvido no people.json; nenhum comentário.`); continue; }
-    await publishPublic(id, pub, 'notify', parsed[pub].map(i => `- ${i}`).join('\n'), header, people, !!opt['dry-run']);
+    await publishPublic(id, pub, 'notify', blocks[pub], header, people, !!opt['dry-run']);
   }
 }
 
@@ -1080,4 +1126,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments };
