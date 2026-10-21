@@ -7,7 +7,7 @@
 //   node hub-card.js link <id> --card <md>                  liga um card que já existe no Azure ao nosso card
 //   node hub-card.js link <id> --related <id> [--dry-run]   cria a relação "Related" entre dois work items
 //   node hub-card.js start  (<id> | --card <md>) [--branch <b>]            -> Codificação
-//   node hub-card.js review (<id> | --card <md>) --pr <url> [--branch <b>] [--no-notify] -> Code review
+//   node hub-card.js review (<id> | --card <md>) --pr <url> [--branch <b>] [--to front,pm,qa] [--no-notify] -> Code review
 //   node hub-card.js done   (<id> | --card <md>) [--hours N] [--resumo <md>] [--pr <url>] -> Concluído
 //                                                            (sem --hours: OriginalEstimate > estimativa do card)
 //   node hub-card.js sync [--dry-run]                        fecha (done) os cards do plano cuja branch já está mergeada na origin/main
@@ -193,6 +193,11 @@ const PEOPLE_FILE = path.join(__dirname, 'hub-card.people.json');
 const NOTIFY_STATE_FILE = path.join(__dirname, 'hub-card.notify-state.json');
 const NOTIFY_API = '7.0-preview.3';
 const PUBLIC_KEYS = ['front', 'pm', 'qa'];
+function selectedPublics(opt, keys = PUBLIC_KEYS) {
+  if (!opt || !opt.to) return keys;
+  const wanted = String(opt.to).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  return keys.filter(k => wanted.includes(k));
+}
 
 function readPeople() {
   try { return JSON.parse(fs.readFileSync(PEOPLE_FILE, 'utf8')); } catch { return { front: [], pm: [], qa: [] }; }
@@ -391,6 +396,8 @@ function foraDoCodigoBlocks(md) {
       continue;
     }
     if (!current) continue;
+    // Qualquer outro rótulo em negrito (ex.: "DevOps/infra:", "Gabriel Castro:") encerra o público atual.
+    if (/^\s*(?:[-*]\s*)?\*\*[^*]+\*\*/.test(raw)) { current = null; last = null; continue; }
     const bullet = raw.match(/^(\s*)[-*]\s+(.*)$/);
     if (bullet) {
       const indent = Math.max(0, bullet[1].length - baseIndent);
@@ -420,7 +427,7 @@ async function publishReviewComments(id, card, opt) {
   const pr = String(opt.pr);
   const header = commentHeader(code, pr);
   let any = false;
-  for (const pub of PUBLIC_KEYS) {
+  for (const pub of selectedPublics(opt)) {
     const bodyMd = blocks[pub] || '';
     if (!bodyMd.trim()) continue;
     any = true;
@@ -869,11 +876,12 @@ async function applyTransition(cmd, id, opt, card, hours) {
     history = `🤖 Agente: ${msg}${label}${bits.length ? ' — ' + bits.join(' · ') : ''}.${resumo ? '<br>' + resumo : ''}`;
   }
 
-  let current = '?', tags = [], title = card?.title || '', currentAssigned = null;
+  let current = '?', tags = [], title = card?.title || '', currentAssigned = null, currentCompleted = null;
   if (!opt['dry-run']) {
-    const it = await getItem(id, ['System.State', 'System.Tags', 'System.Title', 'System.AssignedTo']);
+    const it = await getItem(id, ['System.State', 'System.Tags', 'System.Title', 'System.AssignedTo', 'Microsoft.VSTS.Scheduling.CompletedWork']);
     current = it.fields['System.State']; tags = splitTags(it.fields['System.Tags']); title = it.fields['System.Title'];
     currentAssigned = it.fields['System.AssignedTo'];
+    currentCompleted = it.fields['Microsoft.VSTS.Scheduling.CompletedWork'];
     if (current === STATE.done && !opt.force) fail(`${id} já está Concluído. Use --force se for intencional.`);
     if (current === 'Cancelado' && !opt.force) fail(`${id} está Cancelado. Use --force se for intencional.`);
   }
@@ -883,6 +891,9 @@ async function applyTransition(cmd, id, opt, card, hours) {
   if (hours !== null) {
     ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.CompletedWork', value: hours });
     if (cmd === 'done') ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.RemainingWork', value: 0 });
+  } else if (cmd === 'review' && (currentCompleted === null || currentCompleted === undefined || currentCompleted === '')) {
+    // O processo exige Completed Work no estado Code review; inicia em 0.
+    ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.CompletedWork', value: 0 });
   }
   ops.push({ op: 'add', path: '/fields/System.History', value: history });
   if (!opt['dry-run']) {
@@ -1126,4 +1137,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics };
