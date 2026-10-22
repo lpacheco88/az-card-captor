@@ -60,6 +60,32 @@ Pessoas em **`hub-card.people.json`** (`front`, `pm`, `qa`). `people resolve [--
 - **`reply <id> [--note "<texto>"] [--dry-run]`**: publica a resposta de "entrou na main" **sob demanda**, com a linha extra opcional do `--note`. Só funciona se o card já tiver comentário publicado pelo hub-card; senão, avisa e não publica.
 - **Sem duplicar**: estado em `hub-card.notify-state.json` (hash do conteúdo + público). Mesmo conteúdo não republica; conteúdo novo vira **"Atualização:"**. Nunca menciona pessoa fora do `people.json`; não edita nem apaga comentários; o comentário sai com a identidade do PAT; nenhum outro campo do card muda.
 
+## Perguntas ao PM
+
+Seção no card cujo título contém **"Perguntas ao PM"**, um item por pergunta (id `Q-NN` único no card):
+
+```
+- **Q-11:** <pergunta> — **Padrão:** <o que fazemos até a resposta>
+```
+
+- **`ask --card <md> [--only Q-11,Q-12] [--dry-run]`**: lê o `azure:` do card e publica **um comentário por pergunta**,
+  marcando o público `pm` do `hub-card.people.json`: `❓ <código> · Q-11 — <pergunta>`, o padrão e como responder.
+  Sem a seção, avisa e não publica. Mesmo texto não republica; texto alterado vira `Atualização Q-11:`; pergunta já
+  respondida não republica.
+- **`answers [--id <azureId>] [--dry-run]`**: **só leitura** no Azure. Lê os comentários paginados do card,
+  considerando só os publicados **depois da pergunta** e por pessoa diferente do PAT. Comentário com `Q-11:` (ou
+  `Q-11`) em qualquer linha responde aquela pergunta; sem id e com **uma** pergunta aberta, vira a resposta dela;
+  sem id e com **várias** abertas, marca `resposta-ambigua` (nunca adivinha). Converte o HTML (sem menções) e imprime
+  as respostas novas.
+- **`answer <id> --q Q-11 --text "<resposta>" --fonte "<origem>" [--dry-run]`**: registra resposta dada fora do
+  Azure (`✅ Q-11 — resposta registrada (fonte: ...): ...`, sem menções). Se a pergunta ainda não foi publicada,
+  publica antes.
+- Estado em **`hub-card.questions.json`** (por card/Q): pergunta, padrão, `perguntadoEm`, `commentId`, `status`
+  (`aberta`/`respondida`/`resposta-ambigua`), resposta, quem/quando, `respostaCommentId` e `fonte`.
+- **`Claude outputs/perguntas-pm.md`** (v2-hub) é regravado por `ask`/`answers`/`answer`: resumo de abertas por card
+  e uma tabela por card (abertas primeiro), com link do comentário. `--out <arquivo>` troca o destino.
+- O **`sync`** chama `answers` no fim e imprime as respostas novas (sem publicar nada).
+
 ## Horas do card = estimativa de dev sênior (front matter `estimativa:`)
 
 Sem cálculo pelo git. O valor vem do campo **`estimativa:`** no cabeçalho do card `.md`.
