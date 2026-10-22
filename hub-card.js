@@ -5,6 +5,8 @@
 //   node hub-card.js tree [--epic <id>] [--out <md>]        lista o épico inteiro (features/PBIs + filhos), somente leitura
 //   node hub-card.js get <id>                               mostra o card e o pai
 //   node hub-card.js create --card <md> (--parent <id> | --like <taskId>) [--title "..."] [--assign <email>]
+//   node hub-card.js scaffold --plan <plano> [--feature <id>] [--dry-run]
+//                                                            cria Requirement → Back → Front → QA que faltam
 //   node hub-card.js link <id> --card <md>                  liga um card que já existe no Azure ao nosso card
 //   node hub-card.js link <id> --related <id> [--dry-run]   cria a relação "Related" entre dois work items
 //   node hub-card.js start  (<id> | --card <md>) [--branch <b>]            -> Codificação
@@ -719,6 +721,292 @@ async function resolvePlacement(opt) {
   const area = opt.area || (like ? like['System.AreaPath'] : chain[0].area);
   const iteration = opt.iteration || await currentIteration();
   return { parent, chain, area, iteration };
+}
+
+// ---------- scaffold de requisitos e cards a partir do plano ----------
+// Título normalizado para casar plano × Azure: sem caixa, acento, travessão/hífen e espaços extras.
+function normTitle(s) {
+  return norm(s).replace(/[—–‑-]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function extractCode(s) {
+  const m = String(s || '').match(/\b([A-Z][A-Z0-9]*-\d{2})\b/);
+  return m ? m[1] : '';
+}
+function splitTableRow(line) {
+  return String(line).trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+}
+// Back: "TMS-01 (113395)" (já existe) ou "DOC-01 (8h) `card-DOC-01-....md`" (criar).
+function parseBackCell(cell) {
+  const out = [], seen = new Set();
+  const re = /([A-Z][A-Z0-9]*-\d{2})\s*\(([^)]*)\)/g;
+  let m;
+  while ((m = re.exec(cell))) {
+    const after = String(cell).slice(re.lastIndex);
+    const fm = after.match(/^\s*`([^`]+)`/);
+    const info = m[2].trim();
+    const idm = info.match(/^(\d{3,})$/);
+    const hm = info.match(/^(\d+(?:[.,]\d+)?)\s*h$/i);
+    if (seen.has(m[1])) continue;
+    seen.add(m[1]);
+    out.push({
+      code: m[1],
+      existingId: idm ? Number(idm[1]) : null,
+      hours: hm ? Number(hm[1].replace(',', '.')) : null,
+      file: fm ? fm[1] : null,
+    });
+  }
+  if (!out.length) {
+    const re2 = /([A-Z][A-Z0-9]*-\d{2})/g;
+    while ((m = re2.exec(cell))) {
+      if (seen.has(m[1])) continue;
+      seen.add(m[1]);
+      out.push({ code: m[1], existingId: null, hours: null, file: null });
+    }
+  }
+  return out;
+}
+function plannedTitle(cell) {
+  const t = String(cell || '').trim();
+  return !t || /^[—–-]+$/.test(t) ? null : t;
+}
+// Lê as seções "# Feature <id> — <título>" e as tabelas Requirement | Back | Front | QA.
+function parseScaffoldPlan(raw) {
+  const lines = String(raw).replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').split('\n');
+  const features = [];
+  let cur = null;
+  for (const line of lines) {
+    const fh = line.match(/^#\s+Feature\s+(\d+)\s*[—–-]\s*(.*?)\s*$/i);
+    if (fh) {
+      cur = { id: Number(fh[1]), title: fh[2].trim(), guideFile: null, requirements: [] };
+      features.push(cur);
+      continue;
+    }
+    if (!cur) continue;
+    const gm = line.match(/^\s*Guia:\s*(.*)$/i);
+    if (gm && !cur.guideFile) {
+      const bt = gm[1].match(/`([^`]+)`/);
+      if (bt) cur.guideFile = bt[1];
+    }
+    if (!line.trim().startsWith('|')) continue;
+    const cols = splitTableRow(line);
+    if (cols.length < 4) continue;
+    if (/^requirement$/i.test(cols[0]) || /^:?-{3,}:?$/.test(cols[1] || '')) continue;
+    if (!cols[0] || /^:?-{3,}:?$/.test(cols[0])) continue;
+    cur.requirements.push({
+      title: cols[0],
+      backs: parseBackCell(cols[1]),
+      front: plannedTitle(cols[2]),
+      qa: plannedTitle(cols[3]),
+    });
+  }
+  return features;
+}
+function resolveBackCardFile(spec, planDir) {
+  if (spec.file) {
+    const p = path.isAbsolute(spec.file) ? spec.file : path.resolve(planDir, spec.file);
+    return fs.existsSync(p) ? p : null;
+  }
+  const prefix = `card-${spec.code}-`.toLowerCase();
+  const hit = fs.readdirSync(planDir).find(f => f.endsWith('.md') && f.toLowerCase().startsWith(prefix));
+  return hit ? path.join(planDir, hit) : null;
+}
+function guideRef(file) {
+  const ref = String(file || '').replace(/\\/g, '/');
+  if (!ref) return null;
+  return /^Claude outputs\//i.test(ref) ? ref : `Claude outputs/${ref}`;
+}
+function resolveGuideFile(feature, planDir) {
+  if (feature.guideFile) return feature.guideFile;
+  for (const req of feature.requirements) for (const b of req.backs) {
+    const file = resolveBackCardFile(b, planDir);
+    if (!file) continue;
+    const m = fs.readFileSync(file, 'utf8').match(/O card completo est[áa] em `([^`]+)`/i);
+    if (m) return m[1];
+  }
+  return null;
+}
+function requirementDescriptionHtml(req, guideFile) {
+  const objective = req.title.replace(/^\s*\d+\s*[-—–]\s*/, '').trim() || req.title;
+  const backs = req.backs.map(b => b.existingId ? `${b.code} (Azure ${b.existingId})` : b.code).join(', ');
+  const items = [];
+  if (backs) items.push(`<li><strong>Back:</strong> ${esc(backs)}</li>`);
+  if (req.front) items.push(`<li><strong>Front:</strong> ${esc(req.front)}</li>`);
+  if (req.qa) items.push(`<li><strong>QA:</strong> ${esc(req.qa)}</li>`);
+  const ref = guideRef(guideFile);
+  const guide = ref ? `<p><strong>Guia:</strong> <a href="${attr(encodeURI(ref))}">${esc(ref)}</a></p>` : '';
+  return `<h2>Objetivo</h2><p>${esc(objective)}</p><h2>Cards</h2><ul>${items.join('')}</ul>${guide}`;
+}
+function frontQaDescriptionHtml(kind, backs) {
+  const key = String(kind).toLowerCase() === 'qa' ? 'qa' : 'front';
+  const lines = [];
+  for (const b of backs) {
+    if (!b.card) continue;
+    const parsed = parseForaDoCodigo(b.card.body);
+    for (const item of (parsed?.[key] || [])) lines.push(`- **${b.code}:** ${item}`);
+  }
+  return lines.length ? mdToHtml(lines.join('\n')) : '';
+}
+// Mesma consulta do `tree`, mas com a feature como raiz, e todos os níveis.
+async function featureDescendants(rootId) {
+  const w = await ax().post(`${BASE}/wit/wiql?api-version=${API}`, {
+    query: `SELECT [System.Id] FROM WorkItemLinks WHERE ([Source].[System.Id] = ${Number(rootId)} AND [System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward') MODE (Recursive)`,
+  });
+  const ids = [...new Set((w.data.workItemRelations || []).map(r => r.target?.id).filter(Boolean))].filter(id => id !== Number(rootId));
+  const fields = ['System.Id', 'System.WorkItemType', 'System.State', 'System.Title', 'System.Parent', 'System.AreaPath', 'System.IterationPath', 'Microsoft.VSTS.Scheduling.OriginalEstimate'];
+  const items = [];
+  for (let i = 0; i < ids.length; i += 200) {
+    const r = await ax().get(`${BASE}/wit/workitems?ids=${ids.slice(i, i + 200).join(',')}&fields=${fields.join(',')}&api-version=${API}`);
+    items.push(...(r.data.value || []));
+  }
+  return items;
+}
+// A feature está sob o épico? Para sem ler o épico (que pode negar leitura): a comparação é pelo id.
+async function isUnderEpic(id, epic) {
+  let cur = Number(id);
+  for (let i = 0; i < 20 && cur; i++) {
+    if (cur === Number(epic)) return true;
+    const it = await getItem(cur, ['System.WorkItemType', 'System.Parent']);
+    const p = it.fields['System.Parent'];
+    if (!p) return false;
+    cur = Number(p);
+  }
+  return false;
+}
+async function createScaffoldItem({ type, title, description, area, iteration, parent, assignee, estimate, acceptance, tags, history }) {
+  const ops = [
+    { op: 'add', path: '/fields/System.Title', value: title },
+    { op: 'add', path: '/fields/System.Description', value: description || '' },
+    { op: 'add', path: '/fields/System.AreaPath', value: area },
+    { op: 'add', path: '/fields/System.IterationPath', value: iteration },
+    { op: 'add', path: '/relations/-', value: { rel: 'System.LinkTypes.Hierarchy-Reverse', url: `https://dev.azure.com/${ORG}/_apis/wit/workItems/${parent}` } },
+  ];
+  if (tags) ops.push({ op: 'add', path: '/fields/System.Tags', value: tags });
+  if (estimate !== null && estimate !== undefined) ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Scheduling.OriginalEstimate', value: estimate });
+  if (acceptance) ops.push({ op: 'add', path: '/fields/Microsoft.VSTS.Common.AcceptanceCriteria', value: acceptance });
+  if (assignee) ops.push({ op: 'add', path: '/fields/System.AssignedTo', value: assignee });
+  if (history) ops.push({ op: 'add', path: '/fields/System.History', value: history });
+  const r = await ax().post(`${BASE}/wit/workitems/$${encodeURIComponent(type)}?api-version=${API}`, ops, PATCH);
+  return r.data;
+}
+async function cmdScaffold(opt) {
+  const planFile = path.resolve(req(opt.plan, '--plan'));
+  if (!fs.existsSync(planFile)) fail(`Plano não encontrado: ${planFile}`);
+  const features = parseScaffoldPlan(fs.readFileSync(planFile, 'utf8'));
+  const only = opt.feature ? String(opt.feature).split(',').map(s => Number(s.trim())).filter(Boolean) : null;
+  if (only) for (const id of only) if (!features.some(f => f.id === id)) warn(`Feature ${id} não está no plano.`);
+  const selected = only ? features.filter(f => only.includes(f.id)) : features;
+  if (!selected.length) fail('Nenhuma feature do plano para processar.');
+  const epic = Number(opt.epic || EPIC || 105346);
+  const planDir = path.dirname(planFile);
+  const dryRun = !!opt['dry-run'];
+  const planOpt = { ...opt };
+  delete planOpt.plan;
+  let created = 0;
+
+  for (const feature of selected) {
+    console.log(`\n## Feature ${feature.id} — ${feature.title}`);
+    let fItem;
+    try {
+      fItem = await getItem(feature.id, ['System.WorkItemType', 'System.Title', 'System.AreaPath', 'System.IterationPath', 'System.Parent']);
+    } catch (e) {
+      console.log(`⛔ não consegui ler a feature: ${apiError(e)}`);
+      continue;
+    }
+    let under = false;
+    try { under = await isUnderEpic(feature.id, epic); } catch (e) { console.log(`⛔ não consegui verificar o épico: ${apiError(e)}`); continue; }
+    if (!under) {
+      console.log(`⛔ recusada: feature fora do épico ${epic} (pai: ${fItem.fields['System.Parent'] || '-'}). Nada feito.`);
+      continue;
+    }
+    const area = fItem.fields['System.AreaPath'];
+    const iteration = fItem.fields['System.IterationPath'];
+    console.log(`Área: ${area} | Iteração: ${iteration}`);
+
+    let descendants = [];
+    try { descendants = await featureDescendants(feature.id); } catch (e) { console.log(`⛔ não consegui ler os filhos: ${apiError(e)}`); continue; }
+
+    const guideFile = resolveGuideFile(feature, planDir);
+    if (!guideFile) console.log('⚠️  guia não identificado; a descrição do Requirement sairá sem link.');
+    const problems = [];
+    for (const req of feature.requirements) {
+      for (const b of req.backs) {
+        const file = resolveBackCardFile(b, planDir);
+        if (file) { try { b.card = readCard(file); } catch { /* card inválido */ } }
+        if (!b.card) problems.push(`${b.code}: card .md não encontrado em ${planDir}`);
+      }
+    }
+
+    for (const req of feature.requirements) {
+      const existingReq = descendants.find(x => x.fields['System.WorkItemType'] === 'Requirement' && normTitle(x.fields['System.Title']) === normTitle(req.title));
+      let reqId = existingReq ? existingReq.id : null;
+      if (reqId) {
+        console.log(`✔ já existe Requirement ${reqId}: ${existingReq.fields['System.Title']}`);
+      } else {
+        console.log(`${dryRun ? '[dry-run] criaria' : 'criaria'} Requirement: "${req.title}" | pai ${feature.id} | sem estimativa | sem responsável`);
+        if (!dryRun) {
+          const r = await createScaffoldItem({
+            type: 'Requirement', title: req.title, description: requirementDescriptionHtml(req, guideFile),
+            area, iteration, parent: feature.id,
+          });
+          reqId = r.id;
+          created++;
+          console.log(`✅ Requirement ${reqId}: ${req.title}`);
+        }
+      }
+
+      for (const b of req.backs) {
+        const existing = b.existingId
+          ? (descendants.find(x => x.id === b.existingId) || { id: b.existingId, fields: { 'System.WorkItemType': TYPE, 'System.Title': b.card ? `Back — ${b.code} ${b.card.name}` : `Back — ${b.code}` } })
+          : descendants.find(x => x.fields['System.WorkItemType'] === TYPE && extractCode(x.fields['System.Title']) === b.code);
+        if (existing) {
+          console.log(`✔ já existe ${existing.fields['System.WorkItemType'] || TYPE} ${existing.id}: ${existing.fields['System.Title']}`);
+          continue;
+        }
+        if (!b.card) { console.log(`⛔ ${b.code}: sem card .md; Back não criado.`); continue; }
+        const estimativa = parseEstimate(b.card.fm.estimativa);
+        if (estimativa === null) { console.log(`⛔ ${b.code}: card sem "estimativa:"; Back não criado.`); problems.push(`${b.code}: card sem estimativa`); continue; }
+        if (b.hours !== null && b.hours !== estimativa) console.log(`⚠️  ${b.code}: plano ${fmtHours(b.hours)} × card ${fmtHours(estimativa)}; uso a estimativa do card.`);
+        const title = `Back — ${b.code} ${b.card.name}`;
+        console.log(`${dryRun ? '[dry-run] criaria' : 'criaria'} ${TYPE}: "${title}" | pai ${reqId || '(novo Requirement)'} | estimativa ${estimativa}h`);
+        if (dryRun) continue;
+        if (!reqId) { console.log(`⛔ ${b.code}: Requirement não criado; Back pulado.`); continue; }
+        const pat = await patUser();
+        if (!pat.uniqueName) fail('Não consegui resolver o usuário do PAT para atribuir o Back.');
+        const { description, acceptance } = splitCard(b.card.body);
+        const r = await createScaffoldItem({
+          type: TYPE, title, description, area, iteration, parent: reqId,
+          assignee: pat.uniqueName, estimate: estimativa, acceptance, tags: TAG,
+          history: `🤖 Agente: card ${b.code} criado pelo scaffold do plano de requisitos.`,
+        });
+        b.existingId = r.id;
+        created++;
+        console.log(`✅ ${TYPE} ${r.id}: ${title}`);
+        writeCardAzure(b.card, r.id);
+        upsertPlan(planOpt, { card: b.code, azure: r.id, title, status: r.fields['System.State'] });
+      }
+
+      for (const [kind, title, desc] of [['Front', req.front, frontQaDescriptionHtml('Front', req.backs)], ['QA', req.qa, frontQaDescriptionHtml('QA', req.backs)]]) {
+        if (!title) continue;
+        const existing = descendants.find(x => x.fields['System.WorkItemType'] === TYPE && normTitle(x.fields['System.Title']) === normTitle(title));
+        if (existing) {
+          console.log(`✔ já existe ${existing.fields['System.WorkItemType'] || TYPE} ${existing.id}: ${existing.fields['System.Title']}`);
+          continue;
+        }
+        console.log(`${dryRun ? '[dry-run] criaria' : 'criaria'} ${TYPE}: "${title}" | pai ${reqId || '(novo Requirement)'} | sem estimativa | sem responsável`);
+        if (dryRun) continue;
+        if (!reqId) { console.log(`⛔ ${kind}: Requirement não criado; ${kind} pulado.`); continue; }
+        const r = await createScaffoldItem({ type: TYPE, title, description: desc, area, iteration, parent: reqId });
+        created++;
+        console.log(`✅ ${TYPE} ${r.id}: ${title}`);
+      }
+    }
+
+    if (problems.length) {
+      console.log('Não casei:');
+      for (const p of [...new Set(problems)]) console.log(`- ${p}`);
+    }
+  }
+  console.log(`\n${dryRun ? '[dry-run] ' : ''}Total: ${created} card(s) criado(s).`);
 }
 
 // ---------- comandos ----------
@@ -1508,6 +1796,7 @@ async function main() {
     case 'tree': return cmdTree(opt);
     case 'get': return cmdGet(Number(req(pos[0], '<id>')));
     case 'create': return cmdCreate(opt);
+    case 'scaffold': return cmdScaffold(opt);
     case 'link': return cmdLink(Number(req(pos[0], '<id>')), opt);
     case 'reparent': return cmdReparent(Number(req(pos[0], '<id>')), opt);
     case 'describe': return cmdDescribe(Number(req(pos[0], '<id>')), opt);
@@ -1527,4 +1816,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics, parseQuestions, parseCommentAnswers, commentToText, interpretComments };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics, parseQuestions, parseCommentAnswers, commentToText, interpretComments, normTitle, extractCode, parseBackCell, parseScaffoldPlan, requirementDescriptionHtml, frontQaDescriptionHtml, guideRef };

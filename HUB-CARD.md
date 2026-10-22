@@ -8,6 +8,7 @@ nunca aparece na saída.
 | Escolher a feature (pai) | `node <azure-worker>/hub-card.js features` | — |
 | Listar o épico inteiro (somente leitura) | `... tree [--epic <id>] [--out <md>]` | — |
 | Card novo, sem número no Azure | `... create --card "Claude outputs/card-X.md" --parent <feature>` (ou `--like <task code irmão>`) | Não iniciado |
+| Requisitos e cards de um plano | `... scaffold --plan "Claude outputs/plano-requisitos-features.md" [--feature <id>] [--dry-run]` | Cria o que falta |
 | Card que já existe no Azure | `... link <id> --card "Claude outputs/card-X.md"` | — |
 | Começou a implementar | `... start --card "Claude outputs/card-X.md" --branch <branch>` | Codificação |
 | PR aberto | `... review --card ... --pr <link> [--no-notify]` | Code review |
@@ -27,6 +28,16 @@ nunca aparece na saída.
   tags e data da última alteração (`ChangedDate`). Não cria, edita, move nem comenta nada.
 
 - `create`/`link` gravam `azure: <id>` no cabeçalho do card e a linha em `Claude outputs/plano-cards.md` (colunas: Card, Azure, Título, Branch, Status, PR, **Horas**, Atualizado; o `done`/`rehours` grava as horas na coluna Horas).
+- **`scaffold --plan <plano> [--feature <id>] [--dry-run]`**: lê as seções `# Feature <id> — ...` do plano e cria o que falta em cada
+  feature, na ordem **Requirement → Back → Front → QA**. Casa o plano com os descendentes atuais da feature (mesma consulta do
+  `tree`, todos os níveis) por **código** (`TMS-NN`, `DOC-NN`, `E4-NN`) e por **título normalizado** (sem caixa, acento,
+  travessão/hífen e espaços extras): o que casar não é criado nem alterado. Back segue o `create` (título `Back — <código>
+  <título do card>`, estimativa do card, responsável do PAT, `azure:` no card e linha no `plano-cards.md`). Front/QA são Task
+  Codes sem estimativa e **sem responsável**, com a descrição montada a partir dos itens `Front:`/`QA:` do "Fora do código"
+  dos cards back do requisito (com o código de origem). Requirement é do tipo Requirement, sem responsável, com objetivo +
+  cards + link do guia. A área e a iteração são as da **feature** (não a sprint atual). A trava recusa feature fora do épico
+  `TARGET_EPIC_ID`. `--feature` limita a uma feature (ou lista separada por vírgula). `--plan` é o plano de requisitos; a
+  linha do Back continua indo para `Claude outputs/plano-cards.md`.
 - `start`/`review`/`done` mudam o estado, juntam a tag `Hub-Agente`, escrevem no histórico e atualizam o plano.
 - `--dry-run` mostra o que faria sem chamar o Azure. `--preview prev.html` (no `create`) gera a prévia do HTML.
 - Card `Concluído` ou `Cancelado` não é alterado sem `--force`.
