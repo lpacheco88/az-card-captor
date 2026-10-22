@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const {
   normTitle, extractCode, parseBackCell, parseScaffoldPlan,
-  requirementDescriptionHtml, frontQaDescriptionHtml, guideRef,
+  requirementDescriptionHtml, frontQaDescriptionHtml, guideRef, decideSetParent,
 } = require('../hub-card.js');
 
 const plan = `# Regras
@@ -79,6 +79,13 @@ test('frontQaDescriptionHtml: itens do card back com o código de origem', () =>
   assert.match(front, /<strong>DOC-01:<\/strong> tela de tipos/);
   assert.match(qa, /<strong>DOC-01:<\/strong> criar e inativar/);
   assert.ok(!/QA:/.test(front));
+});
+
+test('decideSetParent: adiciona, ignora o mesmo pai e recusa outro pai', () => {
+  assert.strictEqual(decideSetParent([], 105346), 'add');
+  assert.strictEqual(decideSetParent([105346], 105346), 'already');
+  assert.strictEqual(decideSetParent([105340], 105346), 'refuse');
+  assert.strictEqual(decideSetParent([105340, 105346], 105346), 'refuse');
 });
 
 test('guideRef: prefixa a pasta Claude outputs sem duplicar', () => {

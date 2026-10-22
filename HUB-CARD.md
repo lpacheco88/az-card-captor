@@ -16,6 +16,7 @@ nunca aparece na saída.
 | Fechar os cards já mergeados | `... sync [--dry-run]` | Concluído nos mergeados |
 | Ajustar horas (estimativa) | `... rehours <id> [--hours N] [--dry-run]` | Sem mudar o estado |
 | Card no board errado | `... reparent <id> (--like <task code> | --parent <id>) --confirm` | Move o pai e a área/iteração |
+| Vincular Feature ao épico | `... set-parent <id> --parent 105346 --confirm` | Só a relação pai |
 | Mover um card para a sprint atual | `... retarget <id> --confirm [--dry-run]` | Sprint atual do time (sem mudar estado/pai) |
 | Comunicar front/PM/QA | `... notify <id> --to front,pm,qa --md <arquivo> [--pr <link>] [--dry-run]` | — |
 | Resolver pessoas | `... people resolve [--write]` | — |
@@ -47,6 +48,7 @@ nunca aparece na saída.
 - **Responsável**: todo card do fluxo é atribuído ao **usuário autenticado do PAT** (hoje `luciano.pacheco@nstech.com.br`, lido de `connectionData`). `create`, `link`, `start`, `review`, `done` (inclusive pelo `sync`) e `rehours` leem `System.AssignedTo` e, se não for esse usuário, atribuem — na **mesma** chamada do comando, sem histórico extra. **`--assign`** → **`HUB_CARD_ASSIGNEE`** (variável de ambiente, fora do `.env`) ainda sobrescrevem; o `AssignedTo` do irmão (`--like`) **não** é mais usado. Nunca toca card fora do fluxo.
 - `retarget <id> [--dry-run]` move um card **já criado** para a sprint atual do time, **sem** mudar estado nem pai (só `System.IterationPath` + histórico).
 - **Mudar a sprint de um card existente só com `--confirm` e por ordem do Luciano.** `retarget` e `reparent` sem `--confirm` apenas mostram o que fariam e saem com aviso. **Nenhum outro comando** (`rehours`, `done`, `sync`, `link`, `start`, `review`, `describe`) grava `System.IterationPath`; só o `create` define a sprint do card **novo** (sprint atual do time).
+- **`set-parent <id> --parent 105346 --confirm`**: só para **Feature → épico `TARGET_EPIC_ID`**. Mostra antes/depois, recusa se a feature já tiver outro pai e grava **somente** a relação `Hierarchy-Reverse`; não muda área, iteração, estado, responsável nem descrição. Sem `--confirm`, só mostra o que faria.
 ## Comunicação com front, PM e QA
 
 Pessoas em **`hub-card.people.json`** (`front`, `pm`, `qa`). `people resolve [--write]` busca as identidades (pelo e-mail; sem e-mail, pelo nome), mostra nome/e-mail/id e **só grava o `id` com `--write` após confirmação**.

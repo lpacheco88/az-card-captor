@@ -17,6 +17,8 @@
 //   node hub-card.js rehours <id> [--hours N] [--dry-run]    grava OriginalEstimate=CompletedWork=N (ou estimativa), sem mudar estado
 //   node hub-card.js retarget <id> [--dry-run]               move o card para a sprint ATUAL do time (sem mudar estado nem pai)
 //   node hub-card.js reparent <id> (--parent <id> | --like <taskId>) move o card para outro pai (e área/iteração)
+//   node hub-card.js set-parent <id> --parent <épico 105346> --confirm
+//                                                            só a relação pai (Feature → Epic); nada mais muda
 //   node hub-card.js describe <id> --md <arquivo>            acrescenta/substitui a seção "🤖 Situação do backend"
 //                                                            no fim da Descrição (o texto do PM é preservado)
 //   node hub-card.js ask --card <md> [--only Q-11,Q-12] [--dry-run]  publica as perguntas ao PM
@@ -653,7 +655,17 @@ async function ancestry(id) {
   const chain = [];
   let cur = Number(id);
   for (let i = 0; i < 8 && cur; i++) {
-    const it = await getItem(cur, ['System.WorkItemType', 'System.Title', 'System.Parent', 'System.AreaPath', 'System.IterationPath']);
+    let it;
+    try {
+      it = await getItem(cur, ['System.WorkItemType', 'System.Title', 'System.Parent', 'System.AreaPath', 'System.IterationPath']);
+    } catch (e) {
+      // O épico pode estar sem leitura para o PAT; a relação pelo id ainda basta para o `get`.
+      if (e.response?.status === 404 && cur === Number(EPIC)) {
+        chain.push({ id: cur, type: '?', title: '(sem leitura)', area: '-', iteration: '-' });
+        break;
+      }
+      throw e;
+    }
     chain.push({ id: cur, type: it.fields['System.WorkItemType'], title: it.fields['System.Title'], area: it.fields['System.AreaPath'], iteration: it.fields['System.IterationPath'] });
     cur = it.fields['System.Parent'];
   }
@@ -1298,6 +1310,44 @@ async function applyTransition(cmd, id, opt, card, hours) {
   if (cmd === 'done') await maybeDoneReply(id, card, opt);
 }
 
+// set-parent: só a relação pai. Não mexe em área, iteração, estado, responsável nem descrição.
+function decideSetParent(currentParents, target) {
+  const parents = [...new Set((currentParents || []).map(Number).filter(Boolean))];
+  if (!parents.length) return 'add';
+  if (parents.length === 1 && parents[0] === Number(target)) return 'already';
+  return 'refuse';
+}
+async function cmdSetParent(id, opt) {
+  const target = Number(req(opt.parent, '--parent <id do épico>'));
+  const epic = Number(opt.epic || EPIC || 105346);
+  if (target !== epic) fail(`set-parent só aceita o épico ${epic} como pai.`);
+  const it = await ax().get(`${BASE}/wit/workitems/${id}?$expand=relations&api-version=${API}`);
+  const f = it.data.fields;
+  if (f['System.WorkItemType'] !== 'Feature') fail(`${id} é ${f['System.WorkItemType']}, não Feature.`);
+  const rels = it.data.relations || [];
+  const parents = rels
+    .filter(r => r.rel === 'System.LinkTypes.Hierarchy-Reverse')
+    .map(r => Number((String(r.url).match(/\/workItems\/(\d+)$/i) || [])[1]))
+    .filter(Boolean);
+  const decision = decideSetParent(parents, target);
+  console.log(`${id} | ${f['System.WorkItemType']} | ${f['System.State']} | ${f['System.Title']}`);
+  console.log(`  pai: ${parents.length ? parents.join(', ') : '-'} → ${target}`);
+  console.log(`  área: ${f['System.AreaPath']} (inalterada) | iteração: ${f['System.IterationPath']} (inalterada)`);
+  if (decision === 'already') { console.log(`✅ ${id} já é filho do épico ${target}; nada a fazer.`); return; }
+  if (decision === 'refuse') fail(`${id} já tem outro pai (${parents.join(', ')}); não vou trocar. Use reparent se for o caso.`);
+  if (opt['dry-run']) { console.log(`[dry-run] criaria a relação Hierarchy-Reverse ${id} → ${target}; nada mais muda`); return; }
+  if (!opt.confirm) { console.warn('⚠️  sem --confirm: nada gravado. Vincular ao épico só com --confirm.'); return; }
+  const ops = [{ op: 'add', path: '/relations/-', value: { rel: 'System.LinkTypes.Hierarchy-Reverse', url: `https://dev.azure.com/${ORG}/_apis/wit/workItems/${target}` } }];
+  guardNoIteration('set-parent', ops);
+  await ax().patch(`${BASE}/wit/workitems/${id}?api-version=${API}`, ops, PATCH);
+  const after = await ax().get(`${BASE}/wit/workitems/${id}?$expand=relations&api-version=${API}`);
+  const now = (after.data.relations || [])
+    .filter(r => r.rel === 'System.LinkTypes.Hierarchy-Reverse')
+    .map(r => Number((String(r.url).match(/\/workItems\/(\d+)$/i) || [])[1]))
+    .filter(Boolean);
+  console.log(`✅ ${id}: pai → ${now.length ? now.join(', ') : '-'} | área ${after.data.fields['System.AreaPath']} | iteração ${after.data.fields['System.IterationPath']}`);
+}
+
 async function cmdReparent(id, opt) {
   const it = await ax().get(`${BASE}/wit/workitems/${id}?$expand=relations&api-version=${API}`);
   const f = it.data.fields;
@@ -1799,6 +1849,7 @@ async function main() {
     case 'scaffold': return cmdScaffold(opt);
     case 'link': return cmdLink(Number(req(pos[0], '<id>')), opt);
     case 'reparent': return cmdReparent(Number(req(pos[0], '<id>')), opt);
+    case 'set-parent': return cmdSetParent(Number(req(pos[0], '<id>')), opt);
     case 'describe': return cmdDescribe(Number(req(pos[0], '<id>')), opt);
     case 'sync': return cmdSync(opt);
     case 'rehours': return cmdRehours(Number(req(pos[0], '<id>')), opt);
@@ -1816,4 +1867,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics, parseQuestions, parseCommentAnswers, commentToText, interpretComments, normTitle, extractCode, parseBackCell, parseScaffoldPlan, requirementDescriptionHtml, frontQaDescriptionHtml, guideRef };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics, parseQuestions, parseCommentAnswers, commentToText, interpretComments, normTitle, extractCode, parseBackCell, parseScaffoldPlan, requirementDescriptionHtml, frontQaDescriptionHtml, guideRef, decideSetParent };
