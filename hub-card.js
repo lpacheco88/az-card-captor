@@ -17,6 +17,9 @@
 //   node hub-card.js reparent <id> (--parent <id> | --like <taskId>) move o card para outro pai (e área/iteração)
 //   node hub-card.js describe <id> --md <arquivo>            acrescenta/substitui a seção "🤖 Situação do backend"
 //                                                            no fim da Descrição (o texto do PM é preservado)
+//   node hub-card.js ask --card <md> [--only Q-11,Q-12] [--dry-run]  publica as perguntas ao PM
+//   node hub-card.js answers [--id <azureId>] [--dry-run]    lê as respostas do PM (somente leitura)
+//   node hub-card.js answer <id> --q Q-11 --text "..." --fonte "..." [--dry-run]
 //
 // Opções comuns: --dry-run (não chama o Azure, mostra o que faria), --plan <arquivo> (padrão:
 // "<pasta atual>/Claude outputs/plano-cards.md"), --force (permite mexer em card já Concluído).
@@ -192,6 +195,7 @@ function fmtHours(h) { return `${String(h).replace('.', ',')}h`; }
 // ---------- pessoas / comentários (front, PM, QA) ----------
 const PEOPLE_FILE = path.join(__dirname, 'hub-card.people.json');
 const NOTIFY_STATE_FILE = path.join(__dirname, 'hub-card.notify-state.json');
+const QUESTIONS_STATE_FILE = path.join(__dirname, 'hub-card.questions.json');
 const NOTIFY_API = '7.0-preview.3';
 const PUBLIC_KEYS = ['front', 'pm', 'qa'];
 function selectedPublics(opt, keys = PUBLIC_KEYS) {
@@ -1148,6 +1152,298 @@ async function cmdSync(opt) {
       console.error(`${row.card} | ${row.azure} | erro: ${String(e.message).split('\n')[0]}`);
     }
   }
+  try {
+    const total = await collectAnswers({ ...opt, fromSync: true });
+    console.log(`\nanswers: ${total} resposta(s) nova(s).`);
+  } catch (e) {
+    warn(`answers falhou: ${String(e.message).split('\n')[0]}`);
+  }
+}
+
+// ---------- Perguntas ao PM ----------
+function readQuestionsState() { try { return JSON.parse(fs.readFileSync(QUESTIONS_STATE_FILE, 'utf8')); } catch { return {}; } }
+function writeQuestionsState(s) { fs.writeFileSync(QUESTIONS_STATE_FILE, JSON.stringify(s, null, 2) + '\n', 'utf8'); }
+
+// Lê a seção "Perguntas ao PM": um item "- **Q-11:** pergunta — **Padrão:** ...".
+function parseQuestions(md) {
+  const lines = String(md || '').replace(/\r\n/g, '\n').split('\n');
+  let start = -1, level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const h = lines[i].match(/^(#{1,6})\s+(.*)$/);
+    if (h && /perguntas?\s+ao\s+pm/i.test(h[2])) { start = i; level = h[1].length; break; }
+  }
+  if (start < 0) return null;
+  const section = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const h = lines[i].match(/^(#{1,6})\s+/);
+    if (h && h[1].length <= level) break;
+    section.push(lines[i]);
+  }
+  const out = [], seen = new Set();
+  for (const raw of section) {
+    const m = raw.match(/^\s*(?:[-*]\s+)?(?:\*\*)?(Q-\d+)(?:\*\*)?\s*[:：-]\s*(.*)$/i);
+    if (!m) continue;
+    const q = m[1].toUpperCase();
+    if (seen.has(q)) throw new Error(`Pergunta ${q} duplicada na seção "Perguntas ao PM".`);
+    seen.add(q);
+    const rest = m[2].replace(/\*\*/g, '').trim();
+    const p = rest.match(/^(.*?)\s*(?:—|–|-)\s*Padr[aã]o:\s*(.*)$/i);
+    out.push({ q, pergunta: (p ? p[1] : rest).trim(), padrao: (p ? p[2] : '').trim() });
+  }
+  return out;
+}
+
+// HTML de comentário -> texto, removendo as menções (<a data-vss-mention>).
+function commentToText(html) {
+  let s = String(html || '');
+  s = s.replace(/<a\b[^>]*data-vss-mention[^>]*>[\s\S]*?<\/a>/gi, '');
+  s = s.replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|div|li|tr|h\d)>/gi, '\n').replace(/<(li)\b[^>]*>/gi, '- ');
+  s = s.replace(/<[^>]+>/g, '');
+  s = s.replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+  return s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// "Q-11: ..." (ou só "Q-11") em qualquer linha inicia a resposta daquela pergunta.
+function parseCommentAnswers(text) {
+  const lines = String(text || '').replace(/\r/g, '').split('\n');
+  const out = []; let cur = null;
+  for (const line of lines) {
+    const m = line.match(/^\s*(Q-\d+)\s*[:：-]?\s*(.*)$/i);
+    if (m) { if (cur) out.push(cur); cur = { q: m[1].toUpperCase(), parts: [m[2]] }; }
+    else if (cur) cur.parts.push(line);
+  }
+  if (cur) out.push(cur);
+  return out.map(a => ({ q: a.q, resposta: a.parts.join('\n').trim() })).filter(a => a.resposta);
+}
+
+function samePerson(a, b) {
+  if (!a || !b) return false;
+  if (a.id && b.id && a.id === b.id) return true;
+  return !!a.uniqueName && !!b.uniqueName && String(a.uniqueName).toLowerCase() === String(b.uniqueName).toLowerCase();
+}
+
+// Decide as respostas de um card (função pura; usada por answers e pelos testes).
+function interpretComments(comments, openQs, pat) {
+  const out = [];
+  for (const rec of openQs) {
+    const since = rec.perguntadoEm ? new Date(rec.perguntadoEm) : null;
+    const relevant = (comments || []).filter(c => !samePerson(c.createdBy, pat) && (!since || new Date(c.createdDate) > since));
+    let hit = null;
+    for (const c of relevant) {
+      const parsed = parseCommentAnswers(commentToText(c.text));
+      const m = parsed.find(a => a.q === rec.q);
+      if (m) { hit = { comment: c, resposta: m.resposta, ambiguous: false }; break; }
+    }
+    if (!hit) {
+      const plain = relevant.filter(c => parseCommentAnswers(commentToText(c.text)).length === 0);
+      if (plain.length) {
+        const c = plain[plain.length - 1];
+        hit = { comment: c, resposta: commentToText(c.text), ambiguous: openQs.length > 1 };
+      }
+    }
+    if (hit) out.push({ q: rec.q, ...hit });
+  }
+  return out;
+}
+
+function questionText(code, q) {
+  const padrao = !q.padrao ? '-' : (/[.!?]$/.test(q.padrao) ? q.padrao : q.padrao + '.');
+  return `❓ ${code ? code + ' · ' : ''}${q.q} — ${q.pergunta}\nPadrão até a resposta: ${padrao}\nPara responder: comente neste card começando por "${q.q}:".`;
+}
+function questionHtml(code, q, people, update) {
+  const lines = (update ? `Atualização ${q.q}: ` : '') + questionText(code, q);
+  const body = lines.split('\n').map(l => `<p>${esc(l)}</p>`).join('');
+  const mentions = (people || []).map(mentionHtml).join(' ');
+  return body + (mentions ? `<p>${mentions}</p>` : '');
+}
+async function postComment(id, html) {
+  const res = await ax().post(`${BASE}/wit/workItems/${id}/comments?api-version=${NOTIFY_API}`, { text: html }, { headers: { 'Content-Type': 'application/json' } });
+  return res.data && (res.data.id || res.data.commentId);
+}
+async function fetchComments(id) {
+  const out = []; let token = null;
+  do {
+    const url = `${BASE}/wit/workItems/${id}/comments?api-version=${NOTIFY_API}${token ? `&continuationToken=${encodeURIComponent(token)}` : ''}`;
+    const r = await ax().get(url);
+    out.push(...(r.data.comments || []));
+    token = r.data.continuationToken;
+  } while (token);
+  return out;
+}
+
+function findCardByAzureId(id) {
+  const dir = path.resolve(process.cwd(), 'Claude outputs');
+  if (!fs.existsSync(dir)) return null;
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith('.md')) continue;
+    const full = path.join(dir, f);
+    try {
+      if (new RegExp(`^azure:\\s*${Number(id)}\\s*$`, 'm').test(fs.readFileSync(full, 'utf8'))) return readCard(full);
+    } catch { /* ignora */ }
+  }
+  return null;
+}
+
+function questionsRegistryPath(opt) {
+  return opt && opt.out ? path.resolve(String(opt.out)) : path.resolve(process.cwd(), 'Claude outputs', 'perguntas-pm.md');
+}
+function questionLink(azureId, commentId) {
+  return `https://dev.azure.com/${ORG}/${encodeURIComponent(PROJECT || '')}/_workitems/edit/${azureId}/${commentId ? `?discussionId=${commentId}` : ''}`;
+}
+function writeQuestionsRegistry(state, opt) {
+  const file = questionsRegistryPath(opt);
+  if (!fs.existsSync(path.dirname(file))) { warn(`Registro não atualizado: a pasta ${path.dirname(file)} não existe (use --out).`); return; }
+  const cards = Object.values(state || {}).filter(c => c && c.questions && Object.keys(c.questions).length);
+  cards.sort((a, b) => String(a.card || '').localeCompare(String(b.card || '')) || Number(a.azureId) - Number(b.azureId));
+  const openBy = cards.map(c => `${c.card || c.azureId}: ${Object.values(c.questions).filter(q => q.status !== 'respondida').length}`);
+  const L = ['# Perguntas ao PM — hub-card', '', `Atualizado em ${new Date().toISOString().slice(0, 10)}.`, ''];
+  L.push(`**Abertas por card:** ${openBy.length ? openBy.join(' · ') : 'nenhuma'}`, '');
+  if (!cards.length) L.push('_Nenhuma pergunta registrada._', '');
+  for (const c of cards) {
+    L.push(`## ${c.card || '-'} (Azure ${c.azureId})`, '');
+    L.push('| Q | Pergunta | Padrão | Perguntado em | Situação | Resposta | Quem | Quando | Fonte | Link do comentário |');
+    L.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+    const qs = Object.values(c.questions).sort((a, b) => (a.status === 'respondida' ? 1 : 0) - (b.status === 'respondida' ? 1 : 0) || String(a.q).localeCompare(String(b.q)));
+    for (const q of qs) {
+      const cel = v => String(v ?? '-').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+      L.push(`| ${q.q} | ${cel(q.pergunta)} | ${cel(q.padrao)} | ${cel(q.perguntadoEm ? q.perguntadoEm.slice(0, 10) : '-')} | ${cel(q.status)} | ${cel(q.resposta)} | ${cel(q.respondidoPor)} | ${cel(q.respondidoEm ? q.respondidoEm.slice(0, 10) : '-')} | ${cel(q.fonte)} | ${q.commentId ? `[${q.commentId}](${questionLink(c.azureId, q.commentId)})` : '-'} |`);
+    }
+    L.push('');
+  }
+  fs.writeFileSync(file, L.join('\n'), 'utf8');
+  console.log(`📝 Registro: ${file}`);
+}
+
+async function cmdAsk(opt) {
+  const card = readCard(req(opt.card, '--card'));
+  if (!card.azure) fail('O card não tem "azure:" no cabeçalho; rode create/link antes.');
+  const questions = parseQuestions(card.body);
+  if (questions === null) { warn(`Card ${card.code || card.name} sem seção "Perguntas ao PM"; nada publicado.`); return; }
+  if (!questions.length) { warn(`Card ${card.code || card.name}: seção "Perguntas ao PM" sem itens; nada publicado.`); return; }
+  const only = opt.only ? String(opt.only).split(',').map(s => s.trim().toUpperCase()).filter(Boolean) : null;
+  const selected = only ? questions.filter(q => only.includes(q.q)) : questions;
+  if (only) for (const qid of only) if (!questions.some(x => x.q === qid)) warn(`--only ${qid}: pergunta não encontrada no card.`);
+  if (!selected.length) { warn('Nenhuma pergunta selecionada; nada publicado.'); return; }
+  const id = Number(card.azure);
+  const code = card.code || ((card.title || '').match(/^Back\s*[—–-]\s*(\S+)/i) || [])[1] || '';
+  const state = readQuestionsState();
+  state[id] = state[id] || { card: code || card.name, azureId: id, questions: {} };
+  state[id].card = code || state[id].card || card.name;
+  const people = await resolvedPeople(['pm']);
+  if (!people.length) warn('Nenhum PM resolvido no people.json; publicarei sem menção.');
+  for (const q of selected) {
+    const rec = state[id].questions[q.q];
+    if (rec && rec.status === 'respondida') { console.log(`ℹ️  ${id} · ${q.q}: já respondida; não republica.`); continue; }
+    const changed = !!(rec && rec.commentId && (rec.pergunta !== q.pergunta || rec.padrao !== q.padrao));
+    const html = questionHtml(code, q, people, changed);
+    if (opt['dry-run']) {
+      console.log(`\n----- [dry-run] ${id} | ${q.q} | ${changed ? 'atualização' : 'nova'} -----`);
+      console.log(`mencionados: ${people.map(p => `${p.displayName || p.name} <${p.id}>`).join(', ') || '(nenhum)'}`);
+      console.log(html);
+      continue;
+    }
+    const commentId = await postComment(id, html);
+    state[id].questions[q.q] = {
+      card: code || rec?.card || card.name, azureId: id, q: q.q, pergunta: q.pergunta, padrao: q.padrao,
+      perguntadoEm: rec?.perguntadoEm || new Date().toISOString(), commentId,
+      status: rec?.status === 'resposta-ambigua' ? 'aberta' : (rec?.status || 'aberta'), resposta: rec?.resposta || null,
+      respondidoPor: rec?.respondidoPor || null, respondidoEm: rec?.respondidoEm || null, respostaCommentId: rec?.respostaCommentId || null, fonte: rec?.fonte || null,
+    };
+    console.log(`❓ ${id} | ${q.q} | ${changed ? 'atualização' : 'pergunta'} publicada (comentário ${commentId})`);
+  }
+  if (opt['dry-run']) { console.log('\n[dry-run] estado e registro não alterados.'); return; }
+  writeQuestionsState(state);
+  writeQuestionsRegistry(state, opt);
+}
+
+async function collectAnswers(opt) {
+  const state = readQuestionsState();
+  const ids = opt && opt.id ? [Number(opt.id)] : Object.keys(state).map(Number);
+  let total = 0;
+  for (const id of ids) {
+    const c = state[id];
+    if (!c || !c.questions) { if (opt && opt.id) warn(`${id}: sem perguntas registradas.`); continue; }
+    const open = Object.values(c.questions).filter(q => q.status !== 'respondida');
+    if (!open.length) continue;
+    let comments;
+    try { comments = await fetchComments(id); } catch (e) { warn(`${id}: falha ao ler comentários (${e.response?.status || e.message}); seguindo.`); continue; }
+    const pat = await patUser();
+    const hits = interpretComments(comments, open, pat);
+    for (const hit of hits) {
+      const rec = c.questions[hit.q];
+      if (!rec || rec.status === 'respondida') continue;
+      const who = hit.comment.createdBy || {};
+      const when = hit.comment.createdDate || new Date().toISOString();
+      if (hit.ambiguous) {
+        rec.status = 'resposta-ambigua';
+        console.log(`⚠️  ${id} · ${hit.q}: resposta ambígua (${who.displayName || who.uniqueName || who.id}) — decida com answer.`);
+      } else {
+        rec.status = 'respondida';
+        console.log(`✅ ${id} · ${hit.q} — ${String(hit.resposta).split('\n')[0]}`);
+      }
+      rec.resposta = hit.resposta;
+      rec.respondidoPor = who.displayName || who.uniqueName || String(who.id || '-');
+      rec.respondidoEm = when;
+      rec.respostaCommentId = hit.comment.id;
+      rec.fonte = 'azure';
+      total++;
+    }
+  }
+  if (!(opt && opt['dry-run'])) {
+    if (total) writeQuestionsState(state);
+    writeQuestionsRegistry(state, opt);
+  }
+  return total;
+}
+
+async function cmdAnswers(opt) {
+  const total = await collectAnswers(opt);
+  console.log(total ? `\nanswers: ${total} resposta(s) nova(s).` : 'answers: nenhuma resposta nova.');
+}
+
+async function cmdAnswer(id, opt) {
+  const qid = String(req(opt.q, '--q')).toUpperCase();
+  const text = req(opt.text, '--text');
+  const fonte = opt.fonte ? String(opt.fonte) : 'manual';
+  const state = readQuestionsState();
+  let rec = state[id] && state[id].questions && state[id].questions[qid];
+  let cardCode = rec?.card || '';
+  if (!rec) {
+    const card = opt.card ? readCard(opt.card) : findCardByAzureId(id);
+    if (!card) fail(`Pergunta ${qid} não está no estado e não achei o card do Azure ${id} em "Claude outputs" (use --card).`);
+    const questions = parseQuestions(card.body);
+    const q = (questions || []).find(x => x.q.toUpperCase() === qid);
+    if (!q) fail(`Pergunta ${qid} não encontrada no card ${card.code || card.name}.`);
+    cardCode = card.code || ((card.title || '').match(/^Back\s*[—–-]\s*(\S+)/i) || [])[1] || card.name;
+    state[id] = state[id] || { card: cardCode, azureId: id, questions: {} };
+    rec = state[id].questions[qid] = { card: cardCode, azureId: id, q: qid, pergunta: q.pergunta, padrao: q.padrao, perguntadoEm: null, commentId: null, status: 'aberta', resposta: null, respondidoPor: null, respondidoEm: null, respostaCommentId: null, fonte: null };
+  }
+  const qdef = { q: qid, pergunta: rec.pergunta, padrao: rec.padrao };
+  if (!rec.commentId) {
+    const people = await resolvedPeople(['pm']);
+    if (!people.length) warn('Nenhum PM resolvido no people.json; pergunta sem menção.');
+    if (opt['dry-run']) {
+      console.log(`\n----- [dry-run] ${id} | ${qid} | publicaria a pergunta antes -----`);
+      console.log(questionHtml(cardCode, qdef, people, false));
+    } else {
+      rec.commentId = await postComment(id, questionHtml(cardCode, qdef, people, false));
+      rec.perguntadoEm = new Date().toISOString();
+      console.log(`❓ ${id} | ${qid} | pergunta publicada antes (comentário ${rec.commentId})`);
+    }
+  }
+  const answerHtml = `<p>✅ ${esc(qid)} — resposta registrada (fonte: ${esc(fonte)}): ${esc(text)}</p>`;
+  if (opt['dry-run']) { console.log(`\n----- [dry-run] ${id} | ${qid} | resposta -----\n${answerHtml}\n\n[dry-run] estado e registro não alterados.`); return; }
+  rec.respostaCommentId = await postComment(id, answerHtml);
+  const who = await patUser();
+  rec.status = 'respondida';
+  rec.resposta = text;
+  rec.respondidoPor = who.displayName || who.uniqueName || '-';
+  rec.respondidoEm = new Date().toISOString();
+  rec.fonte = fonte;
+  if (!rec.perguntadoEm) rec.perguntadoEm = new Date().toISOString();
+  writeQuestionsState(state);
+  writeQuestionsRegistry(state, opt);
+  console.log(`✅ ${id} | ${qid} | resposta publicada (comentário ${rec.respostaCommentId})`);
 }
 
 async function cmdNotify(id, opt) {
@@ -1220,6 +1516,9 @@ async function main() {
     case 'retarget': return cmdRetarget(Number(req(pos[0], '<id>')), opt);
     case 'notify': return cmdNotify(Number(req(pos[0], '<id>')), opt);
     case 'reply': return cmdReply(Number(req(pos[0], '<id>')), opt);
+    case 'ask': return cmdAsk(opt);
+    case 'answers': return cmdAnswers(opt);
+    case 'answer': return cmdAnswer(Number(req(pos[0], '<id>')), opt);
     case 'people': { if (pos[0] === 'resolve') return cmdPeopleResolve(opt); fail('Uso: people resolve [--write]'); }
     case 'start': case 'review': case 'done': { const { id, card } = idOrCard(); return cmdTransition(cmd, id, opt, card); }
     default:
@@ -1228,4 +1527,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics, parseQuestions, parseCommentAnswers, commentToText, interpretComments };

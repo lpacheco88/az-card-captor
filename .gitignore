@@ -21,3 +21,6 @@ generated_task_codes/
 
 # Estado local do hub-card (deduplicação de comentários)
 hub-card.notify-state.json
+
+# Estado local das perguntas ao PM
+hub-card.questions.json
