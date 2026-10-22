@@ -36,7 +36,8 @@ nunca aparece na saída.
   <título do card>`, estimativa do card, responsável do PAT, `azure:` no card e linha no `plano-cards.md`). Front/QA são Task
   Codes sem estimativa e **sem responsável**, com a descrição montada a partir dos itens `Front:`/`QA:` do "Fora do código"
   dos cards back do requisito (com o código de origem). Requirement é do tipo Requirement, sem responsável, com objetivo +
-  cards + link do guia. A área e a iteração são as da **feature** (não a sprint atual). A trava recusa feature fora do épico
+  cards + link do guia. A área e a iteração são as da **feature** (não a sprint atual); se a feature estiver na sprint
+  atual do time, os itens novos vão para o **backlog** (raiz da iteração). A trava recusa feature fora do épico
   `TARGET_EPIC_ID`. `--feature` limita a uma feature (ou lista separada por vírgula). `--plan` é o plano de requisitos; a
   linha do Back continua indo para `Claude outputs/plano-cards.md`.
 - `start`/`review`/`done` mudam o estado, juntam a tag `Hub-Agente`, escrevem no histórico e atualizam o plano.

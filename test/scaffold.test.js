@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const {
   normTitle, extractCode, parseBackCell, parseScaffoldPlan,
-  requirementDescriptionHtml, frontQaDescriptionHtml, guideRef, decideSetParent,
+  requirementDescriptionHtml, frontQaDescriptionHtml, guideRef, decideSetParent, scaffoldIterationFor,
 } = require('../hub-card.js');
 
 const plan = `# Regras
@@ -86,6 +86,13 @@ test('decideSetParent: adiciona, ignora o mesmo pai e recusa outro pai', () => {
   assert.strictEqual(decideSetParent([105346], 105346), 'already');
   assert.strictEqual(decideSetParent([105340], 105346), 'refuse');
   assert.strictEqual(decideSetParent([105340, 105346], 105346), 'refuse');
+});
+
+test('scaffoldIterationFor: sprint atual vai para o backlog; as demais mantêm a feature', () => {
+  const s21 = 'Squad Varejo\\2026\\2026-S21_(12-10 a 23-10)';
+  assert.strictEqual(scaffoldIterationFor(s21, s21), 'Squad Varejo');
+  assert.strictEqual(scaffoldIterationFor(s21, 'Squad Varejo\\2026\\2026-S24_(23-11 a 04-12)'), s21);
+  assert.strictEqual(scaffoldIterationFor('Squad Varejo', s21), 'Squad Varejo');
 });
 
 test('guideRef: prefixa a pasta Claude outputs sem duplicar', () => {

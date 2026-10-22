@@ -884,6 +884,13 @@ async function isUnderEpic(id, epic) {
   }
   return false;
 }
+// Itens novos não entram numa sprint que está encerrando: se a feature está na sprint atual do time,
+// o scaffold usa o backlog (raiz da iteração). Fora isso, mantém a iteração da feature.
+function scaffoldIterationFor(featureIteration, current) {
+  const fi = String(featureIteration || '');
+  if (current && fi && fi === String(current)) return fi.split('\\')[0];
+  return fi;
+}
 async function createScaffoldItem({ type, title, description, area, iteration, parent, assignee, estimate, acceptance, tags, history }) {
   const ops = [
     { op: 'add', path: '/fields/System.Title', value: title },
@@ -931,8 +938,11 @@ async function cmdScaffold(opt) {
       continue;
     }
     const area = fItem.fields['System.AreaPath'];
-    const iteration = fItem.fields['System.IterationPath'];
-    console.log(`Área: ${area} | Iteração: ${iteration}`);
+    const featureIteration = fItem.fields['System.IterationPath'];
+    let current = null;
+    try { current = await currentIteration(); } catch { /* sem sprint atual do time */ }
+    const iteration = scaffoldIterationFor(featureIteration, current);
+    console.log(`Área: ${area} | Iteração dos itens: ${iteration}${iteration !== featureIteration ? ` (backlog; feature em ${featureIteration})` : ''}`);
 
     let descendants = [];
     try { descendants = await featureDescendants(feature.id); } catch (e) { console.log(`⛔ não consegui ler os filhos: ${apiError(e)}`); continue; }
@@ -1867,4 +1877,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics, parseQuestions, parseCommentAnswers, commentToText, interpretComments, normTitle, extractCode, parseBackCell, parseScaffoldPlan, requirementDescriptionHtml, frontQaDescriptionHtml, guideRef, decideSetParent };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics, parseQuestions, parseCommentAnswers, commentToText, interpretComments, normTitle, extractCode, parseBackCell, parseScaffoldPlan, requirementDescriptionHtml, frontQaDescriptionHtml, guideRef, decideSetParent, scaffoldIterationFor };
