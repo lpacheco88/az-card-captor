@@ -2,6 +2,7 @@
 // hub-card.js — ciclo de vida de UM card do backend no Azure DevOps (Task Code "Back — ...").
 //
 //   node hub-card.js features [--epic <id>]                 lista as features/PBIs do épico (para escolher o pai)
+//   node hub-card.js tree [--epic <id>] [--out <md>]        lista o épico inteiro (features/PBIs + filhos), somente leitura
 //   node hub-card.js get <id>                               mostra o card e o pai
 //   node hub-card.js create --card <md> (--parent <id> | --like <taskId>) [--title "..."] [--assign <email>]
 //   node hub-card.js link <id> --card <md>                  liga um card que já existe no Azure ao nosso card
@@ -739,6 +740,95 @@ async function cmdFeatures(opt) {
   }
 }
 
+function shortDate(v) {
+  if (!v) return '-';
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? String(v) : d.toISOString().slice(0, 10);
+}
+
+async function cmdTree(opt) {
+  const epic = Number(opt.epic || EPIC);
+  if (!epic) fail('Informe --epic ou TARGET_EPIC_ID no .env.');
+  const w = await ax().post(`${BASE}/wit/wiql?api-version=${API}`, {
+    query: `SELECT [System.Id] FROM WorkItemLinks WHERE ([Source].[System.Id] = ${epic} AND [System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward') MODE (Recursive)`,
+  });
+  const ids = [...new Set((w.data.workItemRelations || []).map(r => r.target?.id).filter(Boolean))].filter(id => id !== epic);
+  const fields = [
+    'System.Id', 'System.WorkItemType', 'System.State', 'System.Title', 'System.Parent',
+    'System.Tags', 'System.IterationPath', 'System.AssignedTo',
+    'Microsoft.VSTS.Scheduling.OriginalEstimate', 'Microsoft.VSTS.Scheduling.CompletedWork',
+    'System.ChangedDate',
+  ];
+  const items = [];
+  for (let i = 0; i < ids.length; i += 200) {
+    const r = await ax().get(`${BASE}/wit/workitems?ids=${ids.slice(i, i + 200).join(',')}&fields=${fields.join(',')}&api-version=${API}`);
+    items.push(...r.data.value);
+  }
+  const byId = new Map(items.map(x => [x.id, x]));
+  const kids = new Map();
+  for (const x of items) {
+    const p = x.fields['System.Parent'];
+    if (!p) continue;
+    if (!kids.has(p)) kids.set(p, []);
+    kids.get(p).push(x);
+  }
+  for (const arr of kids.values()) arr.sort((a, b) => a.id - b.id);
+
+  let epicTitle = '';
+  try { epicTitle = (await getItem(epic, ['System.Title'])).fields['System.Title'] || ''; } catch { /* sem título */ }
+  const code = t => ((String(t || '').match(/^Back\s*[—–-]\s*(\S+)/i) || [])[1]) || '';
+  const cell = v => String(v ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+  const header = [
+    '| Id | Task Code | Título | Tipo | Estado | Sprint | Responsável | Estimativa | Concluído | Tags | Alterado |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+  ];
+  const row = (x, depth) => {
+    const f = x.fields;
+    return '| ' + [
+      x.id,
+      cell(code(f['System.Title'])),
+      cell(`${'↳ '.repeat(depth)}${f['System.Title'] || ''}`),
+      cell(f['System.WorkItemType']),
+      cell(f['System.State']),
+      cell(f['System.IterationPath']),
+      cell(who(f['System.AssignedTo'])),
+      f['Microsoft.VSTS.Scheduling.OriginalEstimate'] ?? '-',
+      f['Microsoft.VSTS.Scheduling.CompletedWork'] ?? '-',
+      cell(f['System.Tags']),
+      cell(shortDate(f['System.ChangedDate'])),
+    ].join(' | ') + ' |';
+  };
+
+  const roots = kids.get(epic) || [];
+  const byState = {};
+  for (const x of items) { const s = x.fields['System.State'] || '-'; byState[s] = (byState[s] || 0) + 1; }
+  const lines = [`# Épico ${epic}${epicTitle ? ' — ' + epicTitle : ''}`, ''];
+  lines.push(`${items.length} itens descendentes${items.length ? ' — ' + Object.entries(byState).map(([s, n]) => `${s}: ${n}`).join(' · ') : ''}`, '');
+  if (!roots.length) lines.push('_Sem itens sob o épico._', '');
+  for (const root of roots) {
+    const f = root.fields;
+    lines.push(`## ${root.id} — ${f['System.WorkItemType']} — ${f['System.Title'] || ''}`, '');
+    lines.push(...header);
+    const walk = (id, depth) => {
+      const x = byId.get(id);
+      if (!x) return;
+      lines.push(row(x, depth));
+      for (const c of kids.get(id) || []) walk(c.id, depth + 1);
+    };
+    walk(root.id, 0);
+    lines.push('');
+  }
+  const md = lines.join('\n');
+  if (opt.out) {
+    const file = path.resolve(String(opt.out));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, md, 'utf8');
+    console.log(`🌳 Épico ${epic}: ${items.length} itens → ${file}`);
+  } else {
+    process.stdout.write(md + '\n');
+  }
+}
+
 async function cmdGet(id) {
   const it = await getItem(id, ['System.Id', 'System.WorkItemType', 'System.State', 'System.Title', 'System.Parent', 'System.Tags', 'System.AreaPath', 'System.IterationPath', 'Microsoft.VSTS.Scheduling.CompletedWork']);
   const f = it.fields;
@@ -1119,6 +1209,7 @@ async function main() {
   };
   switch (cmd) {
     case 'features': return cmdFeatures(opt);
+    case 'tree': return cmdTree(opt);
     case 'get': return cmdGet(Number(req(pos[0], '<id>')));
     case 'create': return cmdCreate(opt);
     case 'link': return cmdLink(Number(req(pos[0], '<id>')), opt);

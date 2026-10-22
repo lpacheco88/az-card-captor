@@ -6,6 +6,7 @@ nunca aparece na saída.
 | Momento | Comando | Estado no Azure |
 | --- | --- | --- |
 | Escolher a feature (pai) | `node <azure-worker>/hub-card.js features` | — |
+| Listar o épico inteiro (somente leitura) | `... tree [--epic <id>] [--out <md>]` | — |
 | Card novo, sem número no Azure | `... create --card "Claude outputs/card-X.md" --parent <feature>` (ou `--like <task code irmão>`) | Não iniciado |
 | Card que já existe no Azure | `... link <id> --card "Claude outputs/card-X.md"` | — |
 | Começou a implementar | `... start --card "Claude outputs/card-X.md" --branch <branch>` | Codificação |
@@ -19,6 +20,11 @@ nunca aparece na saída.
 | Resolver pessoas | `... people resolve [--write]` | — |
 | Responder "entrou na main" | `... reply <id> [--note "<texto>"] [--dry-run]` | — |
 | `describe <id> --md <arquivo>` | Acrescenta ou substitui a seção "🤖 Situação do backend" no fim da Descrição, sem apagar o texto do PM | — |
+
+- **`tree [--epic <id>] [--out <md>]`** (somente leitura): usa WIQL recursivo e `GET wit/workitems` para listar o épico
+  (`TARGET_EPIC_ID`, padrão 105346) e todos os descendentes. Imprime (ou grava em `--out`) uma tabela por feature/PBI
+  com id, Task Code, título, tipo, estado, sprint (`IterationPath`), responsável, `OriginalEstimate`, `CompletedWork`,
+  tags e data da última alteração (`ChangedDate`). Não cria, edita, move nem comenta nada.
 
 - `create`/`link` gravam `azure: <id>` no cabeçalho do card e a linha em `Claude outputs/plano-cards.md` (colunas: Card, Azure, Título, Branch, Status, PR, **Horas**, Atualizado; o `done`/`rehours` grava as horas na coluna Horas).
 - `start`/`review`/`done` mudam o estado, juntam a tag `Hub-Agente`, escrevem no histórico e atualizam o plano.
