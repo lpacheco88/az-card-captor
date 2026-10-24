@@ -24,3 +24,7 @@ hub-card.notify-state.json
 
 # Estado local das perguntas ao PM
 hub-card.questions.json
+
+# Informações sobre o projeto/equipe (não versionar)
+hub-card.people.json
+update_card_112485.js
