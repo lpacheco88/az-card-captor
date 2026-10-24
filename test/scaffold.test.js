@@ -4,6 +4,7 @@ const assert = require('node:assert');
 const {
   normTitle, extractCode, parseBackCell, parseScaffoldPlan,
   requirementDescriptionHtml, frontQaDescriptionHtml, guideRef, decideSetParent, scaffoldIterationFor,
+  answersReportStamp,
 } = require('../hub-card.js');
 
 const plan = `# Regras
@@ -93,6 +94,17 @@ test('scaffoldIterationFor: sprint atual vai para o backlog; as demais mantêm a
   assert.strictEqual(scaffoldIterationFor(s21, s21), 'Squad Varejo');
   assert.strictEqual(scaffoldIterationFor(s21, 'Squad Varejo\\2026\\2026-S24_(23-11 a 04-12)'), s21);
   assert.strictEqual(scaffoldIterationFor('Squad Varejo', s21), 'Squad Varejo');
+});
+
+test('answersReportStamp: usa a última resposta em UTC no formato AAAA-MM-DD-HHmm', () => {
+  assert.strictEqual(answersReportStamp([
+    { respondidoEm: '2026-10-23T18:21:00Z' },
+    { respondidoEm: '2026-10-23T18:51:02Z' },
+  ]), '2026-10-23-1851');
+});
+
+test('answersReportStamp: sem respostas usa o horário atual', () => {
+  assert.strictEqual(answersReportStamp([], new Date('2026-10-24T12:34:56Z')), '2026-10-24-1234');
 });
 
 test('guideRef: prefixa a pasta Claude outputs sem duplicar', () => {

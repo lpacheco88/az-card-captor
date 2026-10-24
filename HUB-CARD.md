@@ -98,6 +98,9 @@ Seção no card cujo título contém **"Perguntas ao PM"**, um item por pergunta
   (`aberta`/`respondida`/`resposta-ambigua`), resposta, quem/quando, `respostaCommentId` e `fonte`.
 - **`Claude outputs/perguntas-pm.md`** (v2-hub) é regravado por `ask`/`answers`/`answer`: resumo de abertas por card
   e uma tabela por card (abertas primeiro), com link do comentário. `--out <arquivo>` troca o destino.
+- **Relatório do `answers`/`sync`**: quando há resposta nova, grava
+  **`Claude outputs/respostas-pm-<AAAA-MM-DD>-<HHmm>.md`** (UTC, horário da última resposta da rodada). Nunca
+  sobrescreve: se o arquivo já existir, anexa uma seção “Rodada adicional” com data/hora.
 - O **`sync`** chama `answers` no fim e imprime as respostas novas (sem publicar nada).
 
 ## Horas do card = estimativa de dev sênior (front matter `estimativa:`)

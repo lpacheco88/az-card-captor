@@ -1501,7 +1501,12 @@ async function cmdSync(opt) {
     }
   }
   try {
-    const total = await collectAnswers({ ...opt, fromSync: true });
+    const collected = [];
+    const total = await collectAnswers({ ...opt, fromSync: true }, collected);
+    if (total && !opt['dry-run']) {
+      const file = writeAnswersReport(collected, opt);
+      if (file) console.log(`📝 Relatório: ${file}`);
+    }
     console.log(`\nanswers: ${total} resposta(s) nova(s).`);
   } catch (e) {
     warn(`answers falhou: ${String(e.message).split('\n')[0]}`);
@@ -1704,7 +1709,45 @@ async function cmdAsk(opt) {
   writeQuestionsRegistry(state, opt);
 }
 
-async function collectAnswers(opt) {
+// Nome do relatório de respostas por rodada: AAAA-MM-DD-HHmm (UTC), usando a última resposta lida.
+function answersReportStamp(answers, now = new Date()) {
+  const dates = (answers || [])
+    .map(a => (a.respondidoEm ? new Date(a.respondidoEm) : null))
+    .filter(d => d && !Number.isNaN(d.getTime()));
+  const last = dates.length ? new Date(Math.max(...dates.map(d => d.getTime()))) : now;
+  return last.toISOString().slice(0, 16).replace('T', '-').replace(':', '');
+}
+// Nunca sobrescreve: se o arquivo da rodada já existe, anexa uma seção nova com data/hora.
+function writeAnswersReport(answers, opt) {
+  if (!answers || !answers.length) return null;
+  const dir = path.resolve(process.cwd(), 'Claude outputs');
+  if (!fs.existsSync(dir)) { warn(`Relatório não gerado: a pasta ${dir} não existe.`); return null; }
+  const stamp = answersReportStamp(answers);
+  const file = path.join(dir, `respostas-pm-${stamp}.md`);
+  const exists = fs.existsSync(file);
+  const now = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  const cell = v => String(v ?? '—').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+  const date = iso => iso ? new Date(iso).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '—';
+  const link = a => a.respostaCommentId
+    ? `[${a.respostaCommentId}](https://dev.azure.com/${ORG}/${encodeURIComponent(PROJECT || '')}/_workitems/edit/${a.azureId}/?discussionId=${a.respostaCommentId})`
+    : '—';
+  const lines = [];
+  if (exists) {
+    lines.push('', '---', '', `## Rodada adicional — ${now}`, '');
+  } else {
+    lines.push(`# Respostas do PM — ${stamp.slice(0, 10)} ${stamp.slice(11, 13)}:${stamp.slice(13)} UTC`, '');
+    lines.push('Gerado pelo `hub-card answers`. Somente leitura no Azure; nenhum comentário foi publicado.', '');
+  }
+  lines.push('| Card | Q | Pergunta | Padrão | Resposta | Situação | Link | Data |');
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
+  for (const a of [...answers].sort((x, y) => Number(x.azureId) - Number(y.azureId) || String(x.q).localeCompare(String(y.q)))) {
+    lines.push(`| ${cell(a.card || a.azureId)} (${a.azureId}) | ${cell(a.q)} | ${cell(a.pergunta)} | ${cell(a.padrao)} | ${cell(a.resposta)} | ${cell(a.status)} | ${link(a)} | ${date(a.respondidoEm)} |`);
+  }
+  fs.appendFileSync(file, lines.join('\n') + '\n', 'utf8');
+  return file;
+}
+
+async function collectAnswers(opt, collected = []) {
   const state = readQuestionsState();
   const ids = opt && opt.id ? [Number(opt.id)] : Object.keys(state).map(Number);
   let total = 0;
@@ -1734,6 +1777,12 @@ async function collectAnswers(opt) {
       rec.respondidoEm = when;
       rec.respostaCommentId = hit.comment.id;
       rec.fonte = 'azure';
+      collected.push({
+        azureId: id, card: c.card || rec.card || String(id), q: rec.q || hit.q,
+        pergunta: rec.pergunta, padrao: rec.padrao, resposta: rec.resposta,
+        status: rec.status, respondidoPor: rec.respondidoPor, respondidoEm: rec.respondidoEm,
+        respostaCommentId: rec.respostaCommentId,
+      });
       total++;
     }
   }
@@ -1745,7 +1794,12 @@ async function collectAnswers(opt) {
 }
 
 async function cmdAnswers(opt) {
-  const total = await collectAnswers(opt);
+  const collected = [];
+  const total = await collectAnswers(opt, collected);
+  if (total && !opt['dry-run']) {
+    const file = writeAnswersReport(collected, opt);
+    if (file) console.log(`📝 Relatório: ${file}`);
+  }
   console.log(total ? `\nanswers: ${total} resposta(s) nova(s).` : 'answers: nenhuma resposta nova.');
 }
 
@@ -1877,4 +1931,4 @@ async function main() {
   }
 }
 if (require.main === module) main().catch(e => fail(e.response ? apiError(e) : String(e.message || e)));
-module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics, parseQuestions, parseCommentAnswers, commentToText, interpretComments, normTitle, extractCode, parseBackCell, parseScaffoldPlan, requirementDescriptionHtml, frontQaDescriptionHtml, guideRef, decideSetParent, scaffoldIterationFor };
+module.exports = { mdToHtml, splitCard, readCard, upsertPlan, migratePlanLines, detectMerged, readPlanRows, parseEstimate, findCardEstimate, resolveDoneHours, decideAssignee, sameIdentity, identityOf, guardNoIteration, parseForaDoCodigo, foraDoCodigoBlocks, mentionHtml, commentHeader, notifyHeader, cleanCommentHtml, publishDecision, planNotifyPublics, doneReplyText, mentionedForPublics, hasPublishedComments, selectedPublics, parseQuestions, parseCommentAnswers, commentToText, interpretComments, normTitle, extractCode, parseBackCell, parseScaffoldPlan, requirementDescriptionHtml, frontQaDescriptionHtml, guideRef, decideSetParent, scaffoldIterationFor, answersReportStamp, writeAnswersReport };
